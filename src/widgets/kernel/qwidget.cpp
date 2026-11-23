@@ -21,6 +21,9 @@
 #include "qstylefactory.h"
 #include "qvariant.h"
 #include "qwidget.h"
+#if QT_CONFIG(vulkan)
+#include "qphasewidgetbridge_p.h"
+#endif
 #include "qstyleoption.h"
 #include "qstylehints.h"
 #if QT_CONFIG(accessibility)
@@ -82,6 +85,8 @@
 #include <sstream>
 
 QT_BEGIN_NAMESPACE
+
+QTLWExtra::~QTLWExtra() = default;
 
 using namespace QNativeInterface::Private;
 using namespace Qt::StringLiterals;

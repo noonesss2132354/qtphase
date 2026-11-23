@@ -16,6 +16,9 @@
 //
 
 #include "qwaylandwindow_p.h"
+#include <QtCore/qmutex.h>
+
+#include <atomic>
 
 #if QT_CONFIG(vulkan)
 #include "qwaylandvulkaninstance_p.h"
@@ -43,14 +46,31 @@ public:
     bool checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
                                          quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn) override;
     void preparePhasedGpuPresent() override;
+    bool beginPhasedGpuPresent(const QSize &pixelSize, qreal dpr) override;
+    void endPhasedGpuPresent() override;
+    bool isPhasedConfigureInProgress() const override;
+    bool isPhasedSizeCurrent(const QSize &pixelSize, qreal dpr) const override;
 
 #if QT_CONFIG(vulkan)
     VkSurfaceKHR *vkSurface();
 #endif
 
+protected:
+    void willApplyConfigure() override;
+    void didApplyConfigure() override;
+    void willUpdateGeometryProtocol() override;
+    void didUpdateGeometryProtocol() override;
+
 private:
+    void publishConfiguredSizeLocked(const QSize &logicalSize) noexcept;
+
     QList<QWaylandShmBuffer *> m_bootBuffers;
     bool m_bootReleased = false;
+    QRecursiveMutex m_waylandCommitMutex;
+    std::atomic<bool> m_configureInProgress{false};
+    std::atomic<uint64_t> m_configuredLogicalKey{0};
+    std::atomic<bool> m_surfaceAlive{true};
+    QSize m_configuredLogicalSize;
 #if QT_CONFIG(vulkan)
     VkSurfaceKHR m_vkSurface = VK_NULL_HANDLE;
 #endif

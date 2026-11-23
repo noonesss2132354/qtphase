@@ -844,6 +844,30 @@ void QPlatformWindow::preparePhasedGpuPresent()
 {
 }
 
+bool QPlatformWindow::beginPhasedGpuPresent(const QSize &pixelSize, qreal dpr)
+{
+    Q_UNUSED(pixelSize);
+    Q_UNUSED(dpr);
+    preparePhasedGpuPresent();
+    return true;
+}
+
+void QPlatformWindow::endPhasedGpuPresent()
+{
+}
+
+bool QPlatformWindow::isPhasedConfigureInProgress() const
+{
+    return false;
+}
+
+bool QPlatformWindow::isPhasedSizeCurrent(const QSize &pixelSize, qreal dpr) const
+{
+    Q_UNUSED(pixelSize);
+    Q_UNUSED(dpr);
+    return true;
+}
+
 /*!
     Delivers an QEvent::UpdateRequest event to the window.
 

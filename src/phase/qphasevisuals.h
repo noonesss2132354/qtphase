@@ -55,6 +55,7 @@ public:
 private:
     friend class QPhaseView;
     friend class QPhaseViewPrivate;
+    friend class QPhasePaintEngine;
     explicit QPhaseVisuals(QPhaseVisualsPrivate *d);
     QPhaseVisualsPrivate *d_ptr = nullptr;
 };

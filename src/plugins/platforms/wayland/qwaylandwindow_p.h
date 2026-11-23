@@ -271,6 +271,10 @@ Q_SIGNALS:
     void wlSurfaceDestroyed();
 
 protected:
+    virtual void willApplyConfigure() {}
+    virtual void didApplyConfigure() {}
+    virtual void willUpdateGeometryProtocol() {}
+    virtual void didUpdateGeometryProtocol() {}
     virtual void doHandleFrameCallback();
     virtual QRect defaultGeometry() const;
     void setFormat(const QSurfaceFormat &format);

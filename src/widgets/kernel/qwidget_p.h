@@ -66,6 +66,10 @@ class QPixmap;
 class QWidgetRepaintManager;
 class QGraphicsProxyWidget;
 class QWidgetItemV2;
+#if QT_CONFIG(vulkan)
+struct QWidgetPhaseNode;
+class QPhaseWidgetBridge;
+#endif
 
 class QStyle;
 
@@ -90,11 +94,16 @@ protected:
 };
 
 struct QTLWExtra {
+    QTLWExtra() = default;
+    ~QTLWExtra();
     // *************************** Cross-platform variables *****************************
 
     // Regular pointers (keep them together to avoid gaps on 64 bits architectures).
     std::unique_ptr<QIcon> icon; // widget icon
     std::unique_ptr<QWidgetRepaintManager> repaintManager;
+#if QT_CONFIG(vulkan)
+    std::unique_ptr<QPhaseWidgetBridge> phaseBridge;
+#endif
     QBackingStore *backingStore;
     QPainter *sharedPainter;
     QWidgetWindow *window;
@@ -722,6 +731,9 @@ public:
     QSizePolicy size_policy;
     QLocale locale;
     QPoint redirectOffset;
+#if QT_CONFIG(vulkan)
+    std::unique_ptr<QWidgetPhaseNode> phaseNode;
+#endif
 #ifndef QT_NO_ACTION
     QList<QAction*> actions;
 #endif

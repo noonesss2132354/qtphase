@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -238,6 +239,7 @@ struct QPhaseSharedVulkanDevice {
     bool supportsTimestamps = false;
     bool hasSwapchainExt = false;
     bool hasIncrementalPresent = false;
+    bool isHardwareGpu = false;
     std::atomic<bool> pipelinesWarmedUp{false};
 
     VkSampler linearSampler = VK_NULL_HANDLE;
@@ -409,6 +411,9 @@ struct QPhaseSharedVulkanDevice {
                 break;
             }
         }
+
+        isHardwareGpu = (chosenProps.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+                         || chosenProps.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
 
         uint32_t qfCount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &qfCount, nullptr);
@@ -868,13 +873,30 @@ struct QPhaseSharedVulkanDevice {
         return true;
     }
 
-    static std::shared_ptr<QPhaseSharedVulkanDevice> acquire(bool requireWaylandWsi, bool *outCacheHit)
+    static std::mutex &sharedMutex()
     {
         static std::mutex s_mutex;
-        static std::weak_ptr<QPhaseSharedVulkanDevice> s_weak;
+        return s_mutex;
+    }
 
-        std::lock_guard<std::mutex> lock(s_mutex);
-        if (auto existing = s_weak.lock()) {
+    static std::weak_ptr<QPhaseSharedVulkanDevice> &sharedWeak()
+    {
+        static std::weak_ptr<QPhaseSharedVulkanDevice> s_weak;
+        return s_weak;
+    }
+
+    static bool isHardwareWsiWarm() noexcept
+    {
+        std::lock_guard<std::mutex> lock(sharedMutex());
+        if (auto existing = sharedWeak().lock())
+            return existing->hasSwapchainExt && existing->isHardwareGpu;
+        return false;
+    }
+
+    static std::shared_ptr<QPhaseSharedVulkanDevice> acquire(bool requireWaylandWsi, bool *outCacheHit)
+    {
+        std::lock_guard<std::mutex> lock(sharedMutex());
+        if (auto existing = sharedWeak().lock()) {
             if (!requireWaylandWsi || existing->hasSwapchainExt) {
                 if (outCacheHit)
                     *outCacheHit = true;
@@ -887,7 +909,7 @@ struct QPhaseSharedVulkanDevice {
         auto fresh = std::make_shared<QPhaseSharedVulkanDevice>();
         if (!fresh->initialize(requireWaylandWsi))
             return nullptr;
-        s_weak = fresh;
+        sharedWeak() = fresh;
         return fresh;
     }
 };
@@ -1018,12 +1040,20 @@ struct QPhaseVulkanBackendData {
     VkDescriptorSet bindlessSet = VK_NULL_HANDLE;
     std::vector<GpuUploadedTexture> uploadedTextures;
     uint64_t syncedImageTableRev = 0;
+    uint64_t maxUploadedImageGen = 0;
 
     // Fence-timeline retirement queues (zero steady-state vkDeviceWaitIdle!)
+    struct RetiredSwapchain {
+        VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+        std::vector<VkImageView> views;
+        std::vector<VkSemaphore> sems;
+        uint64_t retireAfterSeq = 0;
+    };
     uint64_t nextSubmitSeq = 0;
     uint64_t completedSubmitSeq = 0;
     std::vector<RetiredGpuBuffer> retiredBuffers;
     std::vector<RetiredGpuImage> retiredImages;
+    std::vector<RetiredSwapchain> retiredSwapchains;
 
     std::atomic<quint64> glyphCacheHits{0};
     std::atomic<quint64> glyphCacheMisses{0};
@@ -1045,6 +1075,10 @@ struct QPhaseVulkanBackendData {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchainExtent{0, 0};
     bool swapchainHasAlpha = false;
+    bool surfaceCapsCached = false;
+    bool swapchainNeedsRecreate = false;
+    VkSurfaceCapabilitiesKHR cachedSurfaceCaps{};
+    VkPresentModeKHR cachedPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     std::vector<VkImage> swapchainImages;
     std::vector<VkImageView> swapchainViews;
     std::vector<VkSemaphore> renderFinishedSems;
@@ -1091,6 +1125,25 @@ static void reclaimCompletedResources(QPhaseVulkanBackendData *d)
             imgIt = d->retiredImages.erase(imgIt);
         } else {
             ++imgIt;
+        }
+    }
+
+    auto scIt = d->retiredSwapchains.begin();
+    while (scIt != d->retiredSwapchains.end()) {
+        if (scIt->retireAfterSeq <= d->completedSubmitSeq) {
+            for (VkImageView v : scIt->views) {
+                if (v != VK_NULL_HANDLE)
+                    vkDestroyImageView(dev, v, nullptr);
+            }
+            for (VkSemaphore sem : scIt->sems) {
+                if (sem != VK_NULL_HANDLE)
+                    vkDestroySemaphore(dev, sem, nullptr);
+            }
+            if (scIt->swapchain != VK_NULL_HANDLE)
+                vkDestroySwapchainKHR(dev, scIt->swapchain, nullptr);
+            scIt = d->retiredSwapchains.erase(scIt);
+        } else {
+            ++scIt;
         }
     }
 }
@@ -1177,9 +1230,19 @@ QPhaseVulkanBackend::~QPhaseVulkanBackend()
     }
 }
 
+bool QPhaseVulkanBackend::isSharedHardwareDeviceReady() noexcept
+{
+    return QPhaseSharedVulkanDevice::isHardwareWsiWarm();
+}
+
 bool QPhaseVulkanBackend::isDeviceReady() const noexcept
 {
     return d->deviceReady;
+}
+
+bool QPhaseVulkanBackend::isHardwareGpu() const noexcept
+{
+    return d->shared && d->shared->isHardwareGpu;
 }
 
 bool QPhaseVulkanBackend::usedSharedDeviceCache() const noexcept
@@ -1348,6 +1411,7 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
         d->uploadedTextures.clear();
         d->syncedCurveTexelCount = 0;
         d->syncedImageTableRev = 0;
+        d->maxUploadedImageGen = 0;
         for (uint32_t i = 0; i < kFramesInFlight; ++i) {
             FrameSlot &slot = d->frames[i];
             slot.syncedRevision = 0;
@@ -1439,8 +1503,13 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
 
     for (size_t i = 0; i < images.size() && i < kMaxBindlessTextures; ++i) {
         const PhaseImageEntry &entry = images[i];
-        if (!entry.active || entry.isGpuSurface || entry.uploadedToGpu || entry.cpuRgbaPremul.isNull())
+        if (!entry.active || entry.isGpuSurface || entry.uploadedToGpu)
             continue;
+        if (entry.cpuRgbaPremul.isNull()) {
+            qWarning("QtPhase: bindless slot %zu (gen %llu, %dx%d) missing cpuRgbaPremul before GPU upload!",
+                     i, static_cast<unsigned long long>(entry.generation), entry.width, entry.height);
+            continue;
+        }
         totalUploadBytes = alignUp(totalUploadBytes, 16)
                 + VkDeviceSize(entry.width) * VkDeviceSize(entry.height) * 4;
     }
@@ -1619,6 +1688,7 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
 
             d->uploadedTextures[i] = gpuTex;
             entry.uploadedToGpu = true;
+            d->maxUploadedImageGen = std::max(d->maxUploadedImageGen, entry.generation);
 
             VkDescriptorImageInfo di{};
             di.sampler = d->shared->linearSampler;
@@ -1675,9 +1745,10 @@ static bool ensureFrameWorkBuffer(QPhaseVulkanBackendData *d, FrameSlot &f, VkEx
         f.workBuffer = VK_NULL_HANDLE;
     }
 
-    // Dynamic per-surface sizing: ~79 KB for popups/menus, scaling seamlessly to 50k+ prims at 4K!
-    const uint32_t capTiles = std::max(neededTiles, 256u);
-    const uint32_t capSuperTiles = std::max(neededSuperTiles, 16u);
+    // Dynamic per-surface sizing with growth hysteresis: ~79 KB for popups/menus,
+    // avoiding per-pixel reallocation during interactive window drag-resize!
+    const uint32_t capTiles = uint32_t(alignUp(std::max(neededTiles + neededTiles / 2u, 256u), 512u));
+    const uint32_t capSuperTiles = uint32_t(alignUp(std::max(neededSuperTiles + neededSuperTiles / 2u, 16u), 16u));
     const uint32_t capDraws = std::max(neededDraws * 2u, 256u);
     const uint32_t capWords = (capDraws + 31u) / 32u;
     const uint32_t capTileItems = std::clamp(capTiles * 64u, 16384u, 2097152u);
@@ -1747,6 +1818,26 @@ bool QPhaseVulkanBackend::syncArenaToGpu(QPhaseSceneArena &arena,
     const auto &clips = arena.resolvedClips();
     const auto &prims = arena.primitives();
     const auto &order = arena.drawOrder();
+
+    for (uint32_t primIdx : order) {
+        if (primIdx >= prims.size())
+            continue;
+        const PhaseGpuPrimitive &p = prims[primIdx];
+        if (p.kind == uint32_t(PhasePrimKind::Image)) {
+            const uint32_t slot = p.resourceIndex;
+            if (slot >= d->uploadedTextures.size() || d->uploadedTextures[slot].image == VK_NULL_HANDLE) {
+                const auto &imgs = arena.images();
+                const bool inRange = slot < imgs.size();
+                qWarning("QtPhase: Image prim %u references unuploaded bindless slot %u (active=%d, uploaded=%d, cpuNull=%d, imgTableRev=%llu, syncedRev=%llu)",
+                         primIdx, slot,
+                         inRange ? int(imgs[slot].active) : -1,
+                         inRange ? int(imgs[slot].uploadedToGpu) : -1,
+                         inRange ? int(imgs[slot].cpuRgbaPremul.isNull()) : -1,
+                         static_cast<unsigned long long>(arena.imageTableRevision()),
+                         static_cast<unsigned long long>(d->syncedImageTableRev));
+            }
+        }
+    }
 
     f.drawCount = uint32_t(order.size());
     f.bakeBlockCount = 0;
@@ -2157,16 +2248,46 @@ bool QPhaseVulkanBackend::recreateSwapchain(const QSize &pixelSize, bool hasAlph
     if (!d->shared || d->surface == VK_NULL_HANDLE || pixelSize.isEmpty())
         return false;
 
+    static const bool sProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0;
+    QElapsedTimer scProf;
+    if (sProfile)
+        scProf.start();
+
+    // Wait only on THIS backend's 2 in-flight fences (~0.3 ms, no global vkDeviceWaitIdle!)
+    // so oldSwapchain + its Wayland syncobj surface can be destroyed cleanly without ever
+    // accumulating zombie DMA-BUF swapchains or leaving a window black under 4-window resize!
     waitAllBackendFramesIdle(d.get());
+    const qint64 tAfterWait = sProfile ? (scProf.nsecsElapsed() / 1000) : 0;
     VkDevice dev = d->shared->device;
     VkPhysicalDevice phys = d->shared->physDevice;
 
-    VkSurfaceCapabilitiesKHR caps{};
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, d->surface, &caps) != VK_SUCCESS)
-        return false;
+    // Cache surface capabilities & present modes ONCE per VkSurfaceKHR!
+    // In Mesa Wayland WSI, vkGetPhysicalDeviceSurfacePresentModesKHR opens a brand new
+    // wl_registry + binds all 60+ globals + blocks on 2 wl_display_roundtrip()s (~22 ms per resize)!
+    if (!d->surfaceCapsCached) {
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, d->surface, &d->cachedSurfaceCaps) != VK_SUCCESS)
+            return false;
+
+        d->cachedPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        uint32_t pmCount = 0;
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(phys, d->surface, &pmCount, nullptr) == VK_SUCCESS && pmCount > 0) {
+            std::vector<VkPresentModeKHR> modes(pmCount);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(phys, d->surface, &pmCount, modes.data());
+            for (VkPresentModeKHR m : modes) {
+                if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    d->cachedPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                    break;
+                }
+            }
+        }
+        d->surfaceCapsCached = true;
+    }
+
+    const VkSurfaceCapabilitiesKHR &caps = d->cachedSurfaceCaps;
+    const VkPresentModeKHR chosenPresentMode = d->cachedPresentMode;
 
     VkExtent2D extent{};
-    if (caps.currentExtent.width != 0xFFFFFFFFu) {
+    if (caps.currentExtent.width != 0xFFFFFFFFu && d->swapchain == VK_NULL_HANDLE) {
         extent = caps.currentExtent;
     } else {
         extent.width = std::clamp(uint32_t(pixelSize.width()), caps.minImageExtent.width, caps.maxImageExtent.width);
@@ -2185,20 +2306,7 @@ bool QPhaseVulkanBackend::recreateSwapchain(const QSize &pixelSize, bool hasAlph
     else if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR))
         compAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
 
-    VkPresentModeKHR chosenPresentMode = VK_PRESENT_MODE_FIFO_KHR;
-    uint32_t pmCount = 0;
-    if (vkGetPhysicalDeviceSurfacePresentModesKHR(phys, d->surface, &pmCount, nullptr) == VK_SUCCESS && pmCount > 0) {
-        std::vector<VkPresentModeKHR> modes(pmCount);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(phys, d->surface, &pmCount, modes.data());
-        for (VkPresentModeKHR m : modes) {
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
-                chosenPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-                break;
-            }
-        }
-    }
-
-    uint32_t desiredImages = std::max(minImages, chosenPresentMode == VK_PRESENT_MODE_MAILBOX_KHR ? 4u : 3u);
+    uint32_t desiredImages = std::max(minImages, 3u);
     if (caps.maxImageCount > 0 && desiredImages > caps.maxImageCount)
         desiredImages = caps.maxImageCount;
 
@@ -2222,6 +2330,7 @@ bool QPhaseVulkanBackend::recreateSwapchain(const QSize &pixelSize, bool hasAlph
     VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
     if (vkCreateSwapchainKHR(dev, &scInfo, nullptr, &newSwapchain) != VK_SUCCESS)
         return false;
+    const qint64 tAfterCreate = sProfile ? (scProf.nsecsElapsed() / 1000) : 0;
 
     for (VkImageView v : d->swapchainViews)
         vkDestroyImageView(dev, v, nullptr);
@@ -2229,13 +2338,22 @@ bool QPhaseVulkanBackend::recreateSwapchain(const QSize &pixelSize, bool hasAlph
     for (VkSemaphore sem : d->renderFinishedSems)
         vkDestroySemaphore(dev, sem, nullptr);
     d->renderFinishedSems.clear();
-
     if (oldSwapchain != VK_NULL_HANDLE)
         vkDestroySwapchainKHR(dev, oldSwapchain, nullptr);
+    const qint64 tAfterDestroy = sProfile ? (scProf.nsecsElapsed() / 1000) : 0;
+    if (sProfile) {
+        std::fprintf(stderr,
+                     "[PhaseProfile SC] px=%ux%u mode=%d desiredImgs=%u waitIdle=%.2fms vkCreateSc=%.2fms vkDestroySc=%.2fms\n",
+                     extent.width, extent.height, int(chosenPresentMode), desiredImages,
+                     double(tAfterWait) / 1000.0,
+                     double(tAfterCreate - tAfterWait) / 1000.0,
+                     double(tAfterDestroy - tAfterCreate) / 1000.0);
+    }
 
     d->swapchain = newSwapchain;
     d->swapchainExtent = extent;
     d->swapchainHasAlpha = hasAlpha;
+    d->swapchainNeedsRecreate = false;
 
     uint32_t imgCount = 0;
     vkGetSwapchainImagesKHR(dev, d->swapchain, &imgCount, nullptr);
@@ -2906,6 +3024,7 @@ bool QPhaseVulkanBackend::benchmarkFrameOffscreen(QPhaseSceneArena &arena,
         outMetrics->gpuHardwareUs = (hwUs > 0) ? hwUs : wallUs;
         outMetrics->damagedPixels = QPhaseDamageTracker::regionPixelArea(bufDmg);
         outMetrics->syncedSceneBytes = syncedBytes;
+        outMetrics->uploadedImageGen = d->maxUploadedImageGen;
     }
     return true;
 }
@@ -2918,27 +3037,55 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
                                                  uint64_t frameTimeNs,
                                                  GpuFrameMetrics *outMetrics,
                                                  bool waitForGpuCompletion,
-                                                 const std::function<void(const GpuFrameMetrics &)> &onGpuPixelsReady)
+                                                 const std::function<void(const GpuFrameMetrics &)> &onGpuPixelsReady,
+                                                 const std::atomic<uint64_t> *expectedSizeKey)
 {
     if (!d->deviceReady || !d->shared || !platformWindow || pixelSize.isEmpty())
         return false;
 
+    const uint64_t mySizeKey = (uint64_t(uint32_t(pixelSize.width())) << 32)
+            | uint64_t(uint32_t(pixelSize.height()));
+    auto isSizeObsolete = [&]() noexcept -> bool {
+        if (expectedSizeKey) {
+            const uint64_t curKey = expectedSizeKey->load(std::memory_order_acquire);
+            if (curKey != 0 && curKey != mySizeKey)
+                return true;
+        }
+        return !platformWindow->isPhasedSizeCurrent(pixelSize, devicePixelRatio);
+    };
+
+    if (isSizeObsolete())
+        return false;
+
+    static const bool sProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0;
     QElapsedTimer submitTimer;
     submitTimer.start();
+    qint64 recreateUs = 0;
 
     if (d->swapchain == VK_NULL_HANDLE
+        || d->swapchainNeedsRecreate
         || d->swapchainExtent.width != uint32_t(pixelSize.width())
         || d->swapchainExtent.height != uint32_t(pixelSize.height())
         || d->swapchainHasAlpha != hasAlpha) {
+        QElapsedTimer scT;
+        if (sProfile)
+            scT.start();
         if (!recreateSwapchain(pixelSize, hasAlpha))
+            return false;
+        if (sProfile)
+            recreateUs = scT.nsecsElapsed() / 1000;
+        // Re-check after recreateSwapchain BEFORE acquiring an image or doing GPU work
+        if (isSizeObsolete())
             return false;
     }
 
+    const qint64 tAfterSc = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
     const uint32_t slotIdx = d->currentFrame;
     FrameSlot &f = d->frames[slotIdx];
     vkWaitForFences(d->shared->device, 1, &f.inFlightFence, VK_TRUE, UINT64_MAX);
     d->completedSubmitSeq = std::max(d->completedSubmitSeq, f.submittedSeq);
     reclaimCompletedResources(d.get());
+    const qint64 tAfterFence = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
 
     qint64 gpuHwUs = f.hasValidTimestamps ? readSlotTimestampDurationUs(d.get(), slotIdx)
                                           : d->lastCompletedGpuHwUs;
@@ -2947,6 +3094,7 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
     static constexpr uint64_t kAcquireTimeoutNs = 100'000'000ULL;
     VkResult acq = vkAcquireNextImageKHR(
             d->shared->device, d->swapchain, kAcquireTimeoutNs, f.imageAvailableSem, VK_NULL_HANDLE, &imageIndex);
+    const qint64 tAfterAcq = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
     if (acq == VK_TIMEOUT || acq == VK_NOT_READY)
         return false;
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -2962,6 +3110,7 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
 
     if (!ensureFrameWorkBuffer(d.get(), f, d->swapchainExtent, f.drawCount))
         return false;
+    const qint64 tAfterSync = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
 
     // Single-pass scene hash snapshot shared across swapchainDamageTrackers[imageIndex] and presentSurfaceTracker!
     const QSize actualPxSize(int(d->swapchainExtent.width), int(d->swapchainExtent.height));
@@ -3052,13 +3201,12 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
     metrics.gpuHardwareUs = (gpuHwUs > 0) ? gpuHwUs : submitWorkUs;
     metrics.damagedPixels = damagedPx;
     metrics.syncedSceneBytes = syncedBytes;
+    metrics.uploadedImageGen = d->maxUploadedImageGen;
 
     if (outMetrics)
         *outMetrics = metrics;
     if (onGpuPixelsReady)
         onGpuPixelsReady(metrics);
-
-    platformWindow->preparePhasedGpuPresent();
 
     std::vector<VkRectLayerKHR> presentRects;
     VkPresentRegionKHR presentRegion{};
@@ -3095,15 +3243,58 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
         }
     }
 
+    if (expectedSizeKey) {
+        const uint64_t curKey = expectedSizeKey->load(std::memory_order_acquire);
+        if (curKey != 0 && curKey != mySizeKey) {
+            d->swapchainDamageTrackers[imageIndex].reset();
+            d->presentSurfaceTracker.reset();
+            d->swapchainNeedsRecreate = true;
+            d->currentFrame = (slotIdx + 1) % kFramesInFlight;
+            if (sProfile)
+                std::fprintf(stderr, "[PhaseProfile GPU] ABORT(expectedSizeKey) px=%dx%d sc=%.2fms\n",
+                             pixelSize.width(), pixelSize.height(), double(recreateUs) / 1000.0);
+            return false;
+        }
+    }
+
+    // Acquire atomic Wayland commit lock + verify exact configured size match under lock
+    // so vkQueuePresentKHR can NEVER commit an obsolete buffer onto a newer ack_configure + wp_viewport!
+    if (!platformWindow->beginPhasedGpuPresent(pixelSize, devicePixelRatio)) {
+        d->swapchainDamageTrackers[imageIndex].reset();
+        d->presentSurfaceTracker.reset();
+        d->swapchainNeedsRecreate = true;
+        d->currentFrame = (slotIdx + 1) % kFramesInFlight;
+        if (sProfile)
+            std::fprintf(stderr, "[PhaseProfile GPU] ABORT(beginPresent) px=%dx%d sc=%.2fms\n",
+                         pixelSize.width(), pixelSize.height(), double(recreateUs) / 1000.0);
+        return false;
+    }
+
+    const qint64 tBeforePres = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
     VkResult presRes = VK_SUCCESS;
     {
         std::lock_guard<std::mutex> qlock(d->shared->queueMutex);
         presRes = vkQueuePresentKHR(d->shared->graphicsQueue, &presentInfo);
     }
+    platformWindow->endPhasedGpuPresent();
+    const qint64 tAfterPres = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+    if (sProfile) {
+        std::fprintf(stderr,
+                     "[PhaseProfile GPU] px=%dx%d mode=%d imgs=%zu sc=%.2fms fence=%.2fms acq=%.2fms sync=%.2fms sub=%.2fms pres=%.2fms total=%.2fms hw=%.2fms\n",
+                     pixelSize.width(), pixelSize.height(), int(d->cachedPresentMode), d->swapchainImages.size(),
+                     double(recreateUs) / 1000.0,
+                     double(tAfterFence - tAfterSc) / 1000.0,
+                     double(tAfterAcq - tAfterFence) / 1000.0,
+                     double(tAfterSync - tAfterAcq) / 1000.0,
+                     double(tBeforePres - tAfterSync) / 1000.0,
+                     double(tAfterPres - tBeforePres) / 1000.0,
+                     double(tAfterPres) / 1000.0,
+                     double(gpuHwUs) / 1000.0);
+    }
     d->currentFrame = (slotIdx + 1) % kFramesInFlight;
 
     if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR)
-        recreateSwapchain(pixelSize, hasAlpha);
+        d->swapchainNeedsRecreate = true;
 
     return presRes == VK_SUCCESS || presRes == VK_SUBOPTIMAL_KHR;
 }

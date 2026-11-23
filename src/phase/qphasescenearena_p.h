@@ -286,7 +286,9 @@ public:
     const std::vector<uint64_t> &curveTexels() const noexcept { return m_curveTexels; }
 
     void markEnteredGpuSteadyState();
+    void resetGpuSteadyState();
     void releaseUploadedCpuImagePixels();
+    void acknowledgeGpuImagesUploaded(uint64_t upToGeneration);
 
     const std::vector<PhaseResolvedTransform> &resolvedTransforms() const noexcept { return m_resolvedTransforms; }
     const std::vector<PhaseResolvedClip> &resolvedClips() const noexcept { return m_resolvedClips; }

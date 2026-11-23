@@ -38,8 +38,50 @@ QWaylandWindow::WindowType QWaylandPhasedWindow::windowType() const
     return m_bootReleased ? QWaylandWindow::Vulkan : QWaylandWindow::Shm;
 }
 
+void QWaylandPhasedWindow::publishConfiguredSizeLocked(const QSize &logicalSize) noexcept
+{
+    m_configuredLogicalSize = logicalSize;
+    if (logicalSize.width() > 0 && logicalSize.height() > 0) {
+        const uint64_t key = (uint64_t(uint32_t(logicalSize.width())) << 32)
+                | uint64_t(uint32_t(logicalSize.height()));
+        m_configuredLogicalKey.store(key, std::memory_order_release);
+    } else {
+        m_configuredLogicalKey.store(0, std::memory_order_release);
+    }
+}
+
+void QWaylandPhasedWindow::willUpdateGeometryProtocol()
+{
+    m_waylandCommitMutex.lock();
+}
+
+void QWaylandPhasedWindow::didUpdateGeometryProtocol()
+{
+    publishConfiguredSizeLocked(geometry().size());
+    m_waylandCommitMutex.unlock();
+}
+
+void QWaylandPhasedWindow::willApplyConfigure()
+{
+    m_configureInProgress.store(true, std::memory_order_release);
+    m_waylandCommitMutex.lock();
+}
+
+void QWaylandPhasedWindow::didApplyConfigure()
+{
+    publishConfiguredSizeLocked(geometry().size());
+    m_configureInProgress.store(false, std::memory_order_release);
+    m_waylandCommitMutex.unlock();
+}
+
 void QWaylandPhasedWindow::invalidateSurface()
 {
+    {
+        QMutexLocker<QRecursiveMutex> lock(&m_waylandCommitMutex);
+        m_surfaceAlive.store(false, std::memory_order_release);
+    }
+    releasePhasedBootResources();
+    m_bootReleased = false;
 #if QT_CONFIG(vulkan)
     if (m_vkSurface != VK_NULL_HANDLE) {
         if (QVulkanInstance *inst = window()->vulkanInstance()) {
@@ -104,7 +146,7 @@ bool QWaylandPhasedWindow::acquirePhasedBootBuffer(const QSize &pixelSize, qreal
 
 void QWaylandPhasedWindow::presentPhasedBootBuffer(void *bufferHandle, const QRegion &damage)
 {
-    if (m_bootReleased || !bufferHandle)
+    if (m_bootReleased || !bufferHandle || !isExposed() || !wlSurface())
         return;
 
     auto *shmBuf = static_cast<QWaylandShmBuffer *>(bufferHandle);
@@ -121,6 +163,21 @@ void QWaylandPhasedWindow::presentPhasedBootBuffer(void *bufferHandle, const QRe
 void QWaylandPhasedWindow::releasePhasedBootResources()
 {
     m_bootReleased = true;
+    {
+        QMutexLocker lock(&mFrameSyncMutex);
+        if (mFrameCallback) {
+            wl_callback_destroy(mFrameCallback);
+            mFrameCallback = nullptr;
+        }
+        mFrameCallbackElapsedTimer.invalidate();
+        mWaitingForFrameCallback = false;
+    }
+    if (mFrameCallbackCheckIntervalTimerId != -1) {
+        killTimer(mFrameCallbackCheckIntervalTimerId);
+        mFrameCallbackCheckIntervalTimerId = -1;
+    }
+    mFrameCallbackTimedOut = false;
+    updateExposure();
     for (QWaylandShmBuffer *buf : std::as_const(m_bootBuffers)) {
         if (buf->busy()) {
             // Wayland compositor still holds this wl_buffer until the new Vulkan DMA-BUF
@@ -160,6 +217,12 @@ bool QWaylandPhasedWindow::createPhasedVulkanSurface(void *vkInstance, void *vkG
     if (createSurfaceFn(inst, &createInfo, nullptr, &surface) != VK_SUCCESS)
         return false;
 
+    {
+        QMutexLocker<QRecursiveMutex> lock(&m_waylandCommitMutex);
+        m_surfaceAlive.store(true, std::memory_order_release);
+        publishConfiguredSizeLocked(geometry().size());
+    }
+
     *static_cast<VkSurfaceKHR *>(vkSurfaceOut) = surface;
     return true;
 #else
@@ -198,9 +261,51 @@ bool QWaylandPhasedWindow::checkPhasedVulkanPresentSupport(void *vkInstance, voi
 
 void QWaylandPhasedWindow::preparePhasedGpuPresent()
 {
-    if (format().swapInterval() > 0)
-        waitForFrameSync(mFrameCallbackTimeout);
-    handleUpdate();
+    mExposeEventNeedsAttachedBuffer = false;
+}
+
+bool QWaylandPhasedWindow::isPhasedConfigureInProgress() const
+{
+    return m_configureInProgress.load(std::memory_order_acquire);
+}
+
+bool QWaylandPhasedWindow::isPhasedSizeCurrent(const QSize &pixelSize, qreal dpr) const
+{
+    if (!m_surfaceAlive.load(std::memory_order_acquire)
+        || m_configureInProgress.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const uint64_t key = m_configuredLogicalKey.load(std::memory_order_acquire);
+    if (key == 0)
+        return true;
+    const QSize expectedLogical(int(uint32_t(key >> 32)), int(uint32_t(key & 0xFFFFFFFFu)));
+    const QSize expectedPx = (expectedLogical * dpr).expandedTo(QSize(1, 1));
+    return expectedPx == pixelSize;
+}
+
+bool QWaylandPhasedWindow::beginPhasedGpuPresent(const QSize &pixelSize, qreal dpr)
+{
+    if (m_configureInProgress.load(std::memory_order_acquire))
+        return false;
+
+    m_waylandCommitMutex.lock();
+    const QSize expectedLogical = m_configuredLogicalSize.isEmpty()
+            ? geometry().size()
+            : m_configuredLogicalSize;
+    const QSize expectedPx = (expectedLogical * dpr).expandedTo(QSize(1, 1));
+    if (!m_surfaceAlive.load(std::memory_order_acquire) || !isExposed() || !wlSurface()
+        || (!expectedLogical.isEmpty() && expectedPx != pixelSize)) {
+        m_waylandCommitMutex.unlock();
+        return false;
+    }
+
+    mExposeEventNeedsAttachedBuffer = false;
+    return true;
+}
+
+void QWaylandPhasedWindow::endPhasedGpuPresent()
+{
+    m_waylandCommitMutex.unlock();
 }
 
 #if QT_CONFIG(vulkan)

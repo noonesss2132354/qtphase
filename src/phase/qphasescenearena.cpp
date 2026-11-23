@@ -875,6 +875,11 @@ void QPhaseSceneArena::markEnteredGpuSteadyState()
     }
 }
 
+void QPhaseSceneArena::resetGpuSteadyState()
+{
+    m_inGpuSteadyState = false;
+}
+
 void QPhaseSceneArena::syncRenderSnapshotFrom(QPhaseSceneArena &src)
 {
     src.resolveHierarchy();
@@ -927,18 +932,19 @@ void QPhaseSceneArena::syncRenderSnapshotFrom(QPhaseSceneArena &src)
     m_clipsDirty = false;
     m_rendererReqs = src.m_rendererReqs;
 
-    // Generation-tracked sync of bindless image & custom GPU surface slots
+    // Generation-tracked non-destructive sync of bindless image & custom GPU surface slots.
+    // QImage is COW ref-counted so copying costs 0 bytes; CPU pixel RAM is only released via
+    // explicit GPU upload receipts (acknowledgeGpuImagesUploaded / releaseUploadedCpuImagePixels)
+    // so pixels can NEVER be dropped before Vulkan confirms upload!
     if (m_imageTableRevision != src.m_imageTableRevision || m_images.size() != src.m_images.size()) {
         if (m_images.size() < src.m_images.size())
             m_images.resize(src.m_images.size());
         for (size_t i = 0; i < src.m_images.size(); ++i) {
             PhaseImageEntry &dstE = m_images[i];
-            PhaseImageEntry &srcE = src.m_images[i];
+            const PhaseImageEntry &srcE = src.m_images[i];
             if (dstE.generation != srcE.generation || dstE.active != srcE.active) {
                 dstE = srcE;
                 dstE.uploadedToGpu = false;
-                if (src.m_inGpuSteadyState && srcE.active && !srcE.isGpuSurface)
-                    srcE.cpuRgbaPremul = QImage();
             } else if (srcE.active && srcE.isGpuSurface) {
                 dstE.width = srcE.width;
                 dstE.height = srcE.height;
@@ -948,11 +954,6 @@ void QPhaseSceneArena::syncRenderSnapshotFrom(QPhaseSceneArena &src)
             }
         }
         m_imageTableRevision = src.m_imageTableRevision;
-    } else if (src.m_inGpuSteadyState) {
-        for (PhaseImageEntry &e : src.m_images) {
-            if (!e.cpuRgbaPremul.isNull())
-                e.cpuRgbaPremul = QImage();
-        }
     }
 
     if (m_curveTexels.size() < src.m_curveTexels.size()) {
@@ -976,6 +977,16 @@ void QPhaseSceneArena::releaseUploadedCpuImagePixels()
         return;
     for (PhaseImageEntry &img : m_images) {
         if (img.active && img.uploadedToGpu && !img.cpuRgbaPremul.isNull())
+            img.cpuRgbaPremul = QImage();
+    }
+}
+
+void QPhaseSceneArena::acknowledgeGpuImagesUploaded(uint64_t upToGeneration)
+{
+    if (!m_inGpuSteadyState || upToGeneration == 0)
+        return;
+    for (PhaseImageEntry &img : m_images) {
+        if (img.active && !img.isGpuSurface && img.generation <= upToGeneration && !img.cpuRgbaPremul.isNull())
             img.cpuRgbaPremul = QImage();
     }
 }
@@ -1444,18 +1455,27 @@ QRegion QPhaseDamageTracker::diffAndAdvance(const QPhaseDamageFrameSnapshot &sna
     }
 
     QRegion dirty;
+    auto addDirtyRect = [&](const QRect &r) {
+        if (r.isEmpty())
+            return;
+        if (dirty.rectCount() >= 24)
+            dirty = QRegion(dirty.boundingRect().united(r));
+        else
+            dirty += r;
+    };
+
     std::vector<uint32_t> survivingCurOrder;
     survivingCurOrder.reserve(snap.visibleOrder.size());
 
     for (uint32_t idx : snap.visibleOrder) {
         const PhasePrimDamageSlot &cur = snap.primSlots[idx];
         if (idx >= m_prevSlots.size() || !m_prevSlots[idx].active) {
-            dirty += cur.devBounds;
+            addDirtyRect(cur.devBounds);
         } else {
             survivingCurOrder.push_back(idx);
             if (m_prevSlots[idx].contentHash != cur.contentHash) {
-                dirty += m_prevSlots[idx].devBounds;
-                dirty += cur.devBounds;
+                addDirtyRect(m_prevSlots[idx].devBounds);
+                addDirtyRect(cur.devBounds);
             }
         }
     }
@@ -1465,7 +1485,7 @@ QRegion QPhaseDamageTracker::diffAndAdvance(const QPhaseDamageFrameSnapshot &sna
     for (uint32_t oldIdx : m_prevVisibleOrder) {
         if (oldIdx >= snap.primSlots.size() || !snap.primSlots[oldIdx].active) {
             if (oldIdx < m_prevSlots.size() && m_prevSlots[oldIdx].active)
-                dirty += m_prevSlots[oldIdx].devBounds;
+                addDirtyRect(m_prevSlots[oldIdx].devBounds);
         } else {
             survivingPrevOrder.push_back(oldIdx);
         }
@@ -1474,7 +1494,7 @@ QRegion QPhaseDamageTracker::diffAndAdvance(const QPhaseDamageFrameSnapshot &sna
     if (survivingPrevOrder.size() == survivingCurOrder.size()) {
         for (size_t k = 0; k < survivingCurOrder.size(); ++k) {
             if (survivingPrevOrder[k] != survivingCurOrder[k])
-                dirty += snap.primSlots[survivingCurOrder[k]].devBounds;
+                addDirtyRect(snap.primSlots[survivingCurOrder[k]].devBounds);
         }
     } else {
         dirty = QRegion(fullRect);

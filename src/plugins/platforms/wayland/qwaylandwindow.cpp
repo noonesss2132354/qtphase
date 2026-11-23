@@ -490,6 +490,7 @@ void QWaylandWindow::setGeometry(const QRect &r)
         && window()->type() != Qt::ToolTip && window()->type() != Qt::Tool) {
         rect.moveTo(screen()->geometry().topLeft());
     }
+    willUpdateGeometryProtocol();
     setGeometry_helper(rect);
 
     if (mShellSurface && !mInResizeFromApplyConfigure) {
@@ -506,6 +507,7 @@ void QWaylandWindow::setGeometry(const QRect &r)
 
     if (isOpaque() && mMask.isEmpty())
         setOpaqueArea(QRect(QPoint(0, 0), rect.size()));
+    didUpdateGeometryProtocol();
 
 
     if (window()->isVisible() && rect.isValid()) {
@@ -730,10 +732,12 @@ void QWaylandWindow::applyConfigure()
     // This could be improved in future as we 're blocking for not just the frame to finish but one additional extra frame.
     if (mInFrameRender)
         QWindowSystemInterface::handleExposeEvent<QWindowSystemInterface::SynchronousDelivery>(window(), QRect(QPoint(0, 0), geometry().size()));
+    willApplyConfigure();
     if (mShellSurface)
         mShellSurface->applyConfigure();
 
     mWaitingToApplyConfigure = false;
+    didApplyConfigure();
     if (mExposed)
         sendExposeEvent(QRect(QPoint(), geometry().size()));
     else

@@ -17,6 +17,9 @@
 #endif
 
 #include <private/qwidget_p.h>
+#if QT_CONFIG(vulkan)
+#include "qphasewidgetbridge_p.h"
+#endif
 #include <private/qapplication_p.h>
 #include <private/qpaintengine_raster_p.h>
 #if QT_CONFIG(graphicseffect)
@@ -175,6 +178,19 @@ void QWidgetRepaintManager::markDirty(const T &r, QWidget *widget, UpdateTime up
     Q_ASSERT(widget->isVisible() && widget->updatesEnabled());
     Q_ASSERT(widget->window() == tlw);
     Q_ASSERT(!r.isEmpty());
+
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
+        if (bufferState == BufferInvalid) {
+            const QPoint off = (widget != tlw) ? widget->mapTo(tlw, QPoint()) : QPoint();
+            td->phaseBridge->markIntersectingDirty(QRegion(r).translated(off));
+        } else {
+            td->phaseBridge->markWidgetDirty(widget);
+        }
+        td->phaseBridge->scheduleUpdate(updateTime == UpdateNow);
+        return;
+    }
+#endif
 
 #if QT_CONFIG(graphicseffect)
     widget->d_func()->invalidateGraphicsEffectsRecursively();
@@ -386,6 +402,12 @@ void QWidgetPrivate::moveRect(const QRect &rect, int dx, int dy)
         return;
 
     QWidget *tlw = q->window();
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
+        td->phaseBridge->scheduleUpdate(false);
+        return;
+    }
+#endif
 
     static const bool accelEnv = qEnvironmentVariableIntValue("QT_NO_FAST_MOVE") == 0;
 
@@ -460,6 +482,13 @@ void QWidgetPrivate::scrollRect(const QRect &rect, int dx, int dy)
 {
     Q_Q(QWidget);
     QWidget *tlw = q->window();
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
+        td->phaseBridge->markWidgetDirty(q);
+        td->phaseBridge->scheduleUpdate(false);
+        return;
+    }
+#endif
 
     QWidgetRepaintManager *repaintManager = QWidgetPrivate::get(tlw)->maybeRepaintManager();
     if (!repaintManager)
@@ -525,6 +554,10 @@ void QWidgetPrivate::scrollRect(const QRect &rect, int dx, int dy)
 */
 bool QWidgetRepaintManager::bltRect(const QRect &rect, int dx, int dy, QWidget *widget)
 {
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge)
+        return false;
+#endif
     const QPoint pos(widget->mapTo(tlw, rect.topLeft()));
     const QRect tlwRect(QRect(pos, rect.size()));
     if (dirty.intersects(tlwRect))
@@ -621,6 +654,13 @@ void QWidgetRepaintManager::sync(QWidget *exposedWidget, const QRegion &exposedR
         return;
     }
 
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
+        td->phaseBridge->onExpose();
+        return;
+    }
+#endif
+
     // Nothing to repaint.
     if (!isDirty() && store->size().isValid()) {
         QPlatformTextureList *widgetTextures = widgetTexturesFor(tlw, exposedWidget);
@@ -660,6 +700,13 @@ void QWidgetRepaintManager::sync()
         }
         return;
     }
+
+#if QT_CONFIG(vulkan)
+    if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
+        td->phaseBridge->scheduleUpdate(true);
+        return;
+    }
+#endif
 
     if (syncAllowed())
         paintAndFlush();

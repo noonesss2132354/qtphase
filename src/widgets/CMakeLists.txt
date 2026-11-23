@@ -78,6 +78,15 @@ qt_internal_extend_target(Widgets CONDITION APPLE
         kernel/qapplication.cpp
 )
 
+qt_internal_extend_target(Widgets CONDITION QT_FEATURE_vulkan
+    SOURCES
+        kernel/qphasepaintengine_p.h kernel/qphasepaintengine.cpp
+        kernel/qphasewidgetbridge_p.h kernel/qphasewidgetbridge.cpp
+    LIBRARIES
+        Qt::Phase
+        Qt::PhasePrivate
+)
+
 # Resources:
 set(qstyle_resource_files
     "styles/images/arrow-down-128.png"

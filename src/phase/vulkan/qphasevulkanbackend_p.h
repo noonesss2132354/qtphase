@@ -19,6 +19,7 @@
 #include <QtCore/qsize.h>
 #include <QtGui/qimage.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -37,6 +38,7 @@ public:
         qint64 gpuHardwareUs = 0;
         quint64 damagedPixels = 0;
         quint64 syncedSceneBytes = 0;
+        uint64_t uploadedImageGen = 0;
     };
 
     QPhaseVulkanBackend();
@@ -44,10 +46,14 @@ public:
 
     Q_DISABLE_COPY_MOVE(QPhaseVulkanBackend)
 
+    // Process-wide lock-free/fast check: true once window #1 has warmed up a hardware Vulkan 1.3 WSI device
+    static bool isSharedHardwareDeviceReady() noexcept;
+
     // Safe to execute on a background worker thread (no Wayland/QWindow calls).
     // Reuses a process-wide shared VkDevice + VmaAllocator + VkPipeline + R8_UNORM glyph atlas singleton!
     bool initializeDevice(bool enableWaylandWsi);
     bool isDeviceReady() const noexcept;
+    bool isHardwareGpu() const noexcept;
     bool usedSharedDeviceCache() const noexcept;
     quint64 sharedDeviceHandle() const noexcept;
     uint32_t sharedDeviceUseCount() const noexcept;
@@ -76,7 +82,8 @@ public:
                                 uint64_t frameTimeNs,
                                 GpuFrameMetrics *outMetrics = nullptr,
                                 bool waitForGpuCompletion = false,
-                                const std::function<void(const GpuFrameMetrics &)> &onGpuPixelsReady = {});
+                                const std::function<void(const GpuFrameMetrics &)> &onGpuPixelsReady = {},
+                                const std::atomic<uint64_t> *expectedSizeKey = nullptr);
 
     quint64 glyphCacheHits() const noexcept;
     quint64 glyphCacheMisses() const noexcept;

@@ -7,6 +7,9 @@
 #include "qlayout.h"
 
 #include "private/qwidget_p.h"
+#if QT_CONFIG(vulkan)
+#include "qphasewidgetbridge_p.h"
+#endif
 #include "private/qapplication_p.h"
 #if QT_CONFIG(accessibility)
 #include <QtGui/qaccessible.h>
@@ -149,8 +152,16 @@ QWidgetWindow::QWidgetWindow(QWidget *widget)
     updateObjectName();
     if (!QCoreApplication::testAttribute(Qt::AA_ForceRasterWidgets)) {
         QSurface::SurfaceType type = QSurface::RasterSurface;
-        if (q_evaluateRhiConfig(m_widget, nullptr, &type))
+        if (q_evaluateRhiConfig(m_widget, nullptr, &type)) {
             setSurfaceType(type);
+        }
+#if QT_CONFIG(vulkan)
+        else if (QPhaseWidgetBridge::isEnabledFor(m_widget)) {
+            setSurfaceType(QSurface::PhasedSurface);
+            QWidgetPrivate::get(m_widget)->topData()->phaseBridge =
+                    std::make_unique<QPhaseWidgetBridge>(m_widget, this);
+        }
+#endif
     }
 
     connect(widget, &QObject::objectNameChanged, this, &QWidgetWindow::updateObjectName);
@@ -159,6 +170,12 @@ QWidgetWindow::QWidgetWindow(QWidget *widget)
 
 QWidgetWindow::~QWidgetWindow()
 {
+#if QT_CONFIG(vulkan)
+    if (m_widget) {
+        if (QTLWExtra *td = QWidgetPrivate::get(m_widget)->maybeTopData(); td && td->phaseBridge)
+            td->phaseBridge->shutdown();
+    }
+#endif
     // destroy while we are still alive
     destroy();
 
@@ -171,6 +188,9 @@ QWidgetWindow::~QWidgetWindow()
     // The QPlaformBackingStore may hold a reference to the window,
     // so the backingstore needs to be deleted first.
     topData->repaintManager.reset(nullptr);
+#if QT_CONFIG(vulkan)
+    topData->phaseBridge.reset();
+#endif
     delete topData->backingStore;
     topData->backingStore = nullptr;
     topData->widgetTextures.clear();
@@ -339,6 +359,21 @@ bool QWidgetWindow::event(QEvent *event)
     case QEvent::Expose:
         handleExposeEvent(static_cast<QExposeEvent *>(event));
         return true;
+
+#if QT_CONFIG(vulkan)
+    case QEvent::Hide:
+        if (QTLWExtra *td = m_widget->d_func()->maybeTopData(); td && td->phaseBridge)
+            td->phaseBridge->onHide();
+        return QWindow::event(event);
+
+    case QEvent::PlatformSurface:
+        if (static_cast<QPlatformSurfaceEvent *>(event)->surfaceEventType()
+                == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed) {
+            if (QTLWExtra *td = m_widget->d_func()->maybeTopData(); td && td->phaseBridge)
+                td->phaseBridge->shutdown();
+        }
+        return QWindow::event(event);
+#endif
 
     case QEvent::WindowStateChange:
         QWindow::event(event); // Update QWindow::Visibility and emit signals.
@@ -869,6 +904,12 @@ void QWidgetWindow::handleResizeEvent(QResizeEvent *event)
     if (updateSize()) {
         QGuiApplication::forwardEvent(m_widget, event);
 
+#if QT_CONFIG(vulkan)
+        if (QTLWExtra *td = m_widget->d_func()->maybeTopData(); td && td->phaseBridge) {
+            td->phaseBridge->onResize();
+            return;
+        }
+#endif
         if (m_widget->d_func()->shouldPaintOnScreen()) {
             QRegion dirtyRegion = m_widget->rect();
             if (m_widget->testAttribute(Qt::WA_StaticContents))
@@ -1119,6 +1160,12 @@ void QWidgetWindow::handleExposeEvent(QExposeEvent *event)
             wPriv->syncBackingStore(event->m_region);
     } else {
         m_widget->setAttribute(Qt::WA_Mapped, false);
+#if QT_CONFIG(vulkan)
+        if (!isVisible()) {
+            if (QTLWExtra *td = wPriv->maybeTopData(); td && td->phaseBridge)
+                td->phaseBridge->onHide();
+        }
+#endif
     }
 }
 

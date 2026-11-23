@@ -136,6 +136,10 @@ public:
     virtual bool checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
                                                  quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn);
     virtual void preparePhasedGpuPresent();
+    virtual bool beginPhasedGpuPresent(const QSize &pixelSize, qreal dpr);
+    virtual void endPhasedGpuPresent();
+    virtual bool isPhasedConfigureInProgress() const;
+    virtual bool isPhasedSizeCurrent(const QSize &pixelSize, qreal dpr) const;
 
     // Window property accessors. Platform plugins should use these
     // instead of accessing QWindow directly.
