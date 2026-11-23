@@ -1,0 +1,276 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Stage 1 of 2-Stage Coarse-to-Fine Binning:
+// 1 workgroup of 32 threads = 1 uint32 visibility bitmask word covering 32 ordered primitives!
+// Runs in O(drawCount) total threads (not O(Tiles * drawCount)) and emits lock-free 32-bit masks
+// per overlapped 128x128 super-tile so phase_tile_bin.comp skips 32 empty prims in 1 instruction!
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+struct ResolvedTransform {
+    float tx;
+    float ty;
+    float m00;
+    float m01;
+    float m10;
+    float m11;
+    float opacity;
+    uint flags;
+};
+
+struct ResolvedClip {
+    float cullMinX;
+    float cullMinY;
+    float cullMaxX;
+    float cullMaxY;
+    float selfMinX;
+    float selfMinY;
+    float selfMaxX;
+    float selfMaxY;
+    float rTL;
+    float rTR;
+    float rBR;
+    float rBL;
+    uint parentRoundedClipIndex;
+    uint hasRoundedAncestorOrSelf;
+};
+
+struct Primitive {
+    uint kind;
+    uint transformIndex;
+    uint clipIndex;
+    uint resourceIndex;
+
+    float x;
+    float y;
+    float w;
+    float h;
+
+    float c0r, c0g, c0b, c0a;
+    float c1r, c1g, c1b, c1a;
+    float br, bg, bb, ba;
+
+    float rTL, rTR, rBR, rBL;
+
+    float p0, p1, p2, p3, p4, p5;
+
+    uint animMode;
+    uint animDurationMs;
+    uint64_t animStartNs;
+    float animFromOpacity;
+    float animToOpacity;
+};
+
+struct PreparedPrim {
+    vec4 effBounds;    // px0, py0, px1, py1 in device pixels
+    vec4 opaqueBounds; // inMinX, inMinY, inMaxX, inMaxY
+    uint primIdx;
+    uint flags;        // bit 0: visible, bit 1: isOpaqueSolidFill
+    float effAnimOp;
+    uint pad0;
+};
+
+layout(buffer_reference, scalar) readonly buffer TransformBuf {
+    ResolvedTransform items[];
+};
+
+layout(buffer_reference, scalar) readonly buffer ClipBuf {
+    ResolvedClip items[];
+};
+
+layout(buffer_reference, scalar) readonly buffer PrimitiveBuf {
+    Primitive items[];
+};
+
+layout(buffer_reference, scalar) readonly buffer DrawOrderBuf {
+    uint indices[];
+};
+
+layout(buffer_reference, scalar) writeonly buffer PreparedPrimBuf {
+    PreparedPrim items[];
+};
+
+layout(buffer_reference, scalar) coherent buffer SuperTileMaskBuf {
+    uint masks[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t transformsAddr;
+    uint64_t clipsAddr;
+    uint64_t primitivesAddr;
+    uint64_t drawOrderAddr;
+    uint64_t preparedPrimsAddr;
+    uint64_t superTileMasksAddr;
+    uint64_t frameTimeNs;
+    float viewportWidth;
+    float viewportHeight;
+    float devicePixelRatio;
+    uint drawCount;
+    uint numPrimWords;
+    uint superMinX;
+    uint superMinY;
+    uint activeSuperTilesX;
+    uint activeSuperTilesY;
+    uint pad0;
+} pc;
+
+float evalAnimationOpacity(Primitive p, uint64_t frameNs) {
+    uint mode = p.animMode & 0x00FFFFFFu;
+    if (mode == 0u || p.animDurationMs == 0u)
+        return 1.0;
+    uint64_t elapsedNs = (frameNs >= p.animStartNs) ? (frameNs - p.animStartNs) : 0ul;
+    float elapsedMs = float(elapsedNs) * 1e-6;
+    float dur = float(p.animDurationMs);
+    if (mode == 1u)
+        return mix(p.animFromOpacity, p.animToOpacity, clamp(elapsedMs / dur, 0.0, 1.0));
+    if (mode == 2u) {
+        float t = clamp(elapsedMs / dur, 0.0, 1.0);
+        return mix(p.animFromOpacity, p.animToOpacity, t * t * (3.0 - 2.0 * t));
+    }
+    if (mode == 3u) {
+        float cycle = mod(elapsedMs, dur) / dur;
+        return mix(p.animFromOpacity, p.animToOpacity, 0.5 - 0.5 * cos(6.283185307 * cycle));
+    }
+    return 1.0;
+}
+
+vec2 txPoint(ResolvedTransform tx, vec2 lp) {
+    return vec2(tx.m00 * lp.x + tx.m01 * lp.y + tx.tx,
+                tx.m10 * lp.x + tx.m11 * lp.y + tx.ty);
+}
+
+void main() {
+    uint wordIdx = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint orderPos = wordIdx * 32u + lane;
+    if (orderPos >= pc.drawCount)
+        return;
+
+    PreparedPrim pp;
+    pp.effBounds = vec4(0.0);
+    pp.opaqueBounds = vec4(0.0);
+    pp.primIdx = 0u;
+    pp.flags = 0u;
+    pp.effAnimOp = 1.0;
+    pp.pad0 = 0u;
+
+    int primStX0 = 0, primStY0 = 0, primStX1 = -1, primStY1 = -1;
+
+    uint primIdx = DrawOrderBuf(pc.drawOrderAddr).indices[orderPos];
+    Primitive p = PrimitiveBuf(pc.primitivesAddr).items[primIdx];
+    if ((p.animMode & 0x40000000u) != 0u) {
+        // CpuOnly primitive skipped on GPU!
+        PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos] = pp;
+        return;
+    }
+    ResolvedTransform tx = TransformBuf(pc.transformsAddr).items[p.transformIndex];
+    ResolvedClip cl = ClipBuf(pc.clipsAddr).items[p.clipIndex];
+
+    float animOp = evalAnimationOpacity(p, pc.frameTimeNs);
+    float baseOp = tx.opacity * animOp;
+    pp.primIdx = primIdx;
+    pp.effAnimOp = animOp;
+
+    if (baseOp > 0.0) {
+        float dpr = pc.devicePixelRatio;
+        vec2 logMin;
+        vec2 logMax;
+
+        if (p.kind == 5u) {
+            vec2 a = txPoint(tx, vec2(p.x, p.y));
+            vec2 b = txPoint(tx, vec2(p.w, p.h));
+            float sc = sqrt(abs(tx.m00 * tx.m11 - tx.m01 * tx.m10));
+            float hw = 0.5 * p.p0 * sc;
+            logMin = min(a, b) - vec2(hw);
+            logMax = max(a, b) + vec2(hw);
+        } else if ((tx.flags & 1u) == 0u) {
+            vec2 a = vec2(p.x * tx.m00 + tx.tx, p.y * tx.m11 + tx.ty);
+            vec2 b = vec2((p.x + p.w) * tx.m00 + tx.tx, (p.y + p.h) * tx.m11 + tx.ty);
+            logMin = min(a, b);
+            logMax = max(a, b);
+        } else {
+            vec2 c0 = txPoint(tx, vec2(p.x, p.y));
+            vec2 c1 = txPoint(tx, vec2(p.x + p.w, p.y));
+            vec2 c2 = txPoint(tx, vec2(p.x, p.y + p.h));
+            vec2 c3 = txPoint(tx, vec2(p.x + p.w, p.y + p.h));
+            logMin = min(min(c0, c1), min(c2, c3));
+            logMax = max(max(c0, c1), max(c2, c3));
+        }
+
+        vec2 devMin = logMin * dpr;
+        vec2 devMax = logMax * dpr;
+        vec2 clipMin = vec2(cl.cullMinX, cl.cullMinY) * dpr;
+        vec2 clipMax = vec2(cl.cullMaxX, cl.cullMaxY) * dpr;
+
+        float expandPx = 1.0;
+        if (p.kind == 2u) {
+            float blurDev = p.p0 * dpr;
+            float spreadDev = p.p1 * dpr;
+            expandPx = max(1.0, ceil(blurDev * 2.5 + max(spreadDev, 0.0) + 2.0));
+        }
+
+        vec2 effMin = clamp(max(floor(devMin - vec2(expandPx)), floor(clipMin)),
+                            vec2(0.0), vec2(pc.viewportWidth, pc.viewportHeight));
+        vec2 effMax = clamp(min(ceil(devMax + vec2(expandPx)), ceil(clipMax)),
+                            vec2(0.0), vec2(pc.viewportWidth, pc.viewportHeight));
+
+        if (effMin.x < effMax.x && effMin.y < effMax.y) {
+            pp.effBounds = vec4(effMin, effMax);
+            pp.flags = 1u;
+
+            bool insideLayer = (p.animMode & 0x80000000u) != 0u;
+            if (!insideLayer && (tx.flags & 1u) == 0u
+                && baseOp >= 0.9999 && p.c0a >= 0.9999
+                && (p.kind == 0u || (p.kind == 1u && p.p1 < 0.5))) {
+                float sxAbs = abs(tx.m00);
+                vec4 rDev = vec4(p.rTL, p.rTR, p.rBR, p.rBL) * sxAbs * dpr;
+                float borderInset = (p.kind == 1u) ? (p.p0 * sxAbs * dpr) : 0.0;
+                float maxR = max(max(max(rDev.x, rDev.y), max(rDev.z, rDev.w)), borderInset) + 1.0;
+
+                float maxClipR = 1.0;
+                if (cl.hasRoundedAncestorOrSelf != 0u) {
+                    uint curClIdx = p.clipIndex;
+                    for (int hop = 0; hop < 4 && curClIdx != 0u; ++hop) {
+                        ResolvedClip rc = ClipBuf(pc.clipsAddr).items[curClIdx];
+                        float cr = max(max(rc.rTL, rc.rTR), max(rc.rBR, rc.rBL)) * dpr + 1.0;
+                        maxClipR = max(maxClipR, cr);
+                        curClIdx = rc.parentRoundedClipIndex;
+                    }
+                }
+
+                vec2 inMin = max(devMin + vec2(maxR), clipMin + vec2(maxClipR));
+                vec2 inMax = min(devMax - vec2(maxR), clipMax - vec2(maxClipR));
+                if (inMin.x < inMax.x && inMin.y < inMax.y) {
+                    pp.opaqueBounds = vec4(inMin, inMax);
+                    pp.flags |= 2u;
+                }
+            }
+
+            int stx0 = int(uint(effMin.x) >> 7u) - int(pc.superMinX);
+            int sty0 = int(uint(effMin.y) >> 7u) - int(pc.superMinY);
+            int stx1 = int(uint(max(effMax.x - 1.0, 0.0)) >> 7u) - int(pc.superMinX);
+            int sty1 = int(uint(max(effMax.y - 1.0, 0.0)) >> 7u) - int(pc.superMinY);
+
+            primStX0 = max(0, stx0);
+            primStY0 = max(0, sty0);
+            primStX1 = min(int(pc.activeSuperTilesX) - 1, stx1);
+            primStY1 = min(int(pc.activeSuperTilesY) - 1, sty1);
+        }
+    }
+
+    PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos] = pp;
+
+    if (primStX0 > primStX1 || primStY0 > primStY1)
+        return;
+
+    uint laneBit = 1u << lane;
+    for (int sy = primStY0; sy <= primStY1; ++sy) {
+        uint rowOff = uint(sy) * pc.activeSuperTilesX;
+        for (int sx = primStX0; sx <= primStX1; ++sx) {
+            uint relSuperIdx = rowOff + uint(sx);
+            atomicOr(SuperTileMaskBuf(pc.superTileMasksAddr).masks[relSuperIdx * pc.numPrimWords + wordIdx], laneBit);
+        }
+    }
+}

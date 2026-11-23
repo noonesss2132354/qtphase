@@ -1,0 +1,171 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Stage 2 of 2-Stage Coarse-to-Fine Binning:
+// Each 8x8 workgroup covers one 128x128 super-tile and scans ONLY the non-zero 32-bit words
+// of SuperTileMaskBuf, skipping 32 non-overlapping primitives in a single instruction!
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct PreparedPrim {
+    vec4 effBounds;
+    vec4 opaqueBounds;
+    uint primIdx;
+    uint flags; // bit 0: visible, bit 1: isOpaqueSolidFill
+    float effAnimOp;
+    uint pad0;
+};
+
+struct TileHeader {
+    uint listOffset;
+    uint countAndFlags; // bits 0..29: count, bit 30: startsWithOpaqueOccluder
+};
+
+layout(buffer_reference, scalar) readonly buffer PreparedPrimBuf {
+    PreparedPrim items[];
+};
+
+layout(buffer_reference, scalar) readonly buffer SuperTileMaskBuf {
+    uint masks[];
+};
+
+layout(buffer_reference, scalar) coherent buffer TileCounterBuf {
+    uint totalItems;
+};
+
+layout(buffer_reference, scalar) writeonly buffer TileHeaderBuf {
+    TileHeader items[];
+};
+
+layout(buffer_reference, scalar) writeonly buffer TileItemsBuf {
+    uint items[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+    uint64_t preparedPrimsAddr;
+    uint64_t superTileMasksAddr;
+    uint64_t tileCounterAddr;
+    uint64_t tileHeadersAddr;
+    uint64_t tileItemsAddr;
+    float viewportWidth;
+    float viewportHeight;
+    uint numPrimWords;
+    uint tilesX;
+    uint tilesY;
+    uint tileMinX;
+    uint tileMinY;
+    uint activeTilesX;
+    uint activeTilesY;
+    uint activeSuperTilesX;
+    uint maxTileItems;
+    uint pad0;
+} pc;
+
+shared uint shGroupMinWord;
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint relTx = gl_GlobalInvocationID.x;
+    uint relTy = gl_GlobalInvocationID.y;
+    bool activeTile = (relTx < pc.activeTilesX) && (relTy < pc.activeTilesY);
+
+    uint txIdx = pc.tileMinX + relTx;
+    uint tyIdx = pc.tileMinY + relTy;
+    if (txIdx >= pc.tilesX || tyIdx >= pc.tilesY)
+        activeTile = false;
+
+    float tx0 = float(txIdx * 16u);
+    float ty0 = float(tyIdx * 16u);
+    float tx1 = min(tx0 + 16.0, pc.viewportWidth);
+    float ty1 = min(ty0 + 16.0, pc.viewportHeight);
+
+    uint relSuperX = (txIdx >> 3u) - (pc.tileMinX >> 3u);
+    uint relSuperY = (tyIdx >> 3u) - (pc.tileMinY >> 3u);
+    uint relSuperIdx = relSuperY * pc.activeSuperTilesX + relSuperX;
+    uint maskRowBase = relSuperIdx * pc.numPrimWords;
+
+    if (tid == 0u)
+        shGroupMinWord = pc.numPrimWords;
+
+    uint hitCount = 0u;
+    uint tileStartOrder = 0u;
+    bool startsOpaque = false;
+
+    if (activeTile) {
+        for (uint w = 0u; w < pc.numPrimWords; ++w) {
+            uint mask = SuperTileMaskBuf(pc.superTileMasksAddr).masks[maskRowBase + w];
+            while (mask != 0u) {
+                int bit = findLSB(mask);
+                mask &= (mask - 1u);
+                uint orderPos = w * 32u + uint(bit);
+                vec4 b = PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos].effBounds;
+                if (b.x < tx1 && b.z > tx0 && b.y < ty1 && b.w > ty0) {
+                    uint flags = PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos].flags;
+                    if ((flags & 2u) != 0u) {
+                        vec4 o = PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos].opaqueBounds;
+                        if (tx0 >= o.x && tx1 <= o.z && ty0 >= o.y && ty1 <= o.w) {
+                            hitCount = 0u;
+                            tileStartOrder = orderPos;
+                            startsOpaque = true;
+                        }
+                    }
+                    ++hitCount;
+                }
+            }
+        }
+    }
+
+    barrier();
+
+    uint tileLinearIdx = tyIdx * pc.tilesX + txIdx;
+    uint baseOffset = 0u;
+    bool needPass2 = false;
+
+    if (activeTile) {
+        if (hitCount == 0u) {
+            TileHeader hdr;
+            hdr.listOffset = 0u;
+            hdr.countAndFlags = 0u;
+            TileHeaderBuf(pc.tileHeadersAddr).items[tileLinearIdx] = hdr;
+        } else {
+            baseOffset = atomicAdd(TileCounterBuf(pc.tileCounterAddr).totalItems, hitCount);
+            if (baseOffset + hitCount > pc.maxTileItems)
+                hitCount = (baseOffset < pc.maxTileItems) ? (pc.maxTileItems - baseOffset) : 0u;
+
+            TileHeader hdr;
+            hdr.listOffset = baseOffset;
+            hdr.countAndFlags = (hitCount & 0x3FFFFFFFu) | (startsOpaque ? 0x40000000u : 0u);
+            TileHeaderBuf(pc.tileHeadersAddr).items[tileLinearIdx] = hdr;
+
+            if (startsOpaque && hitCount == 1u) {
+                TileItemsBuf(pc.tileItemsAddr).items[baseOffset] = tileStartOrder;
+            } else if (hitCount > 0u) {
+                needPass2 = true;
+                atomicMin(shGroupMinWord, tileStartOrder >> 5u);
+            }
+        }
+    }
+
+    barrier();
+
+    if (!needPass2 || shGroupMinWord >= pc.numPrimWords)
+        return;
+
+    uint written = 0u;
+    for (uint w = max(shGroupMinWord, tileStartOrder >> 5u); w < pc.numPrimWords && written < hitCount; ++w) {
+        uint mask = SuperTileMaskBuf(pc.superTileMasksAddr).masks[maskRowBase + w];
+        while (mask != 0u && written < hitCount) {
+            int bit = findLSB(mask);
+            mask &= (mask - 1u);
+            uint orderPos = w * 32u + uint(bit);
+            if (orderPos < tileStartOrder)
+                continue;
+            vec4 b = PreparedPrimBuf(pc.preparedPrimsAddr).items[orderPos].effBounds;
+            if (b.x < tx1 && b.z > tx0 && b.y < ty1 && b.w > ty0) {
+                TileItemsBuf(pc.tileItemsAddr).items[baseOffset + written] = orderPos;
+                ++written;
+            }
+        }
+    }
+}

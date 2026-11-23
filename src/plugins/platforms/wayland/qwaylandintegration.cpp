@@ -6,6 +6,7 @@
 
 #include "qwaylanddisplay_p.h"
 #include "qwaylandshmwindow_p.h"
+#include "qwaylandphasedwindow_p.h"
 #include "qwaylandinputdevice_p.h"
 #include "qwaylandinputcontext_p.h"
 #include "qwaylandinputmethodcontext_p.h"
@@ -151,6 +152,9 @@ QPlatformWindow *QWaylandIntegration::createPlatformWindow(QWindow *window) cons
     if (window->surfaceType() == QSurface::VulkanSurface)
         return new QWaylandVulkanWindow(window, mDisplay.data());
 #endif // QT_CONFIG(vulkan)
+
+    if (window->surfaceType() == QSurface::PhasedSurface)
+        return new QWaylandPhasedWindow(window, mDisplay.data());
 
     return new QWaylandShmWindow(window, mDisplay.data());
 }

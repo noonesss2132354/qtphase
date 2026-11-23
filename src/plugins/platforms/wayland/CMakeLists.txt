@@ -73,6 +73,7 @@ qt_internal_add_module(WaylandClient
         qwaylandshm.cpp qwaylandshm_p.h
         qwaylandshmbackingstore.cpp qwaylandshmbackingstore_p.h
         qwaylandshmwindow.cpp qwaylandshmwindow_p.h
+        qwaylandphasedwindow.cpp qwaylandphasedwindow_p.h
         qwaylandsubsurface.cpp qwaylandsubsurface_p.h
         qwaylandsurface.cpp qwaylandsurface_p.h
         qwaylandviewport.cpp qwaylandviewport_p.h

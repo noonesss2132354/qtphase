@@ -1093,7 +1093,8 @@ bool QWaylandWindow::createDecoration()
     Q_ASSERT_X(QThread::isMainThread(),
                "QWaylandWindow::createDecoration", "not called from main thread");
     // TODO: client side decorations do not work with Vulkan backend.
-    if (window()->surfaceType() == QSurface::VulkanSurface)
+    if (window()->surfaceType() == QSurface::VulkanSurface
+        || window()->surfaceType() == QSurface::PhasedSurface)
         return false;
     if (!mDisplay->supportsWindowDecoration())
         return false;

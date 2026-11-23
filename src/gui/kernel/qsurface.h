@@ -36,7 +36,8 @@ public:
         OpenVGSurface = 3,
         VulkanSurface,
         MetalSurface,
-        Direct3DSurface
+        Direct3DSurface,
+        PhasedSurface
     };
     Q_ENUM(SurfaceType)
 

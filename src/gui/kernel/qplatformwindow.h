@@ -120,6 +120,23 @@ public:
     virtual void deliverUpdateRequest();
     virtual bool allowsIndependentThreadedRendering() const;
 
+    struct PhasedBootBuffer {
+        uchar *data = nullptr;
+        int width = 0;
+        int height = 0;
+        int bytesPerLine = 0;
+        qreal devicePixelRatio = 1.0;
+        void *handle = nullptr;
+    };
+
+    virtual bool acquirePhasedBootBuffer(const QSize &pixelSize, qreal dpr, PhasedBootBuffer *outBuffer);
+    virtual void presentPhasedBootBuffer(void *bufferHandle, const QRegion &damage);
+    virtual void releasePhasedBootResources();
+    virtual bool createPhasedVulkanSurface(void *vkInstance, void *vkGetInstanceProcAddrFn, void *vkSurfaceOut);
+    virtual bool checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
+                                                 quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn);
+    virtual void preparePhasedGpuPresent();
+
     // Window property accessors. Platform plugins should use these
     // instead of accessing QWindow directly.
     QSize windowMinimumSize() const;

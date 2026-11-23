@@ -18,6 +18,7 @@
 #include <QtWaylandClient/private/qwaylandclientbufferintegration_p.h>
 #if QT_CONFIG(vulkan)
 #include <QtWaylandClient/private/qwaylandvulkanwindow_p.h>
+#include <QtWaylandClient/private/qwaylandphasedwindow_p.h>
 #endif
 
 QT_BEGIN_NAMESPACE
@@ -162,6 +163,9 @@ void *QWaylandNativeInterface::nativeResourceForWindow(const QByteArray &resourc
         if (window->surfaceType() == QSurface::VulkanSurface && window->handle()) {
             // return a pointer to the VkSurfaceKHR value, not the value itself
             return static_cast<QWaylandVulkanWindow *>(window->handle())->vkSurface();
+        }
+        if (window->surfaceType() == QSurface::PhasedSurface && window->handle()) {
+            return static_cast<QWaylandPhasedWindow *>(window->handle())->vkSurface();
         }
     }
 #endif

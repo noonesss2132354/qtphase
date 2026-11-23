@@ -804,6 +804,46 @@ bool QPlatformWindow::allowsIndependentThreadedRendering() const
     return true;
 }
 
+bool QPlatformWindow::acquirePhasedBootBuffer(const QSize &pixelSize, qreal dpr, PhasedBootBuffer *outBuffer)
+{
+    Q_UNUSED(pixelSize);
+    Q_UNUSED(dpr);
+    Q_UNUSED(outBuffer);
+    return false;
+}
+
+void QPlatformWindow::presentPhasedBootBuffer(void *bufferHandle, const QRegion &damage)
+{
+    Q_UNUSED(bufferHandle);
+    Q_UNUSED(damage);
+}
+
+void QPlatformWindow::releasePhasedBootResources()
+{
+}
+
+bool QPlatformWindow::createPhasedVulkanSurface(void *vkInstance, void *vkGetInstanceProcAddrFn, void *vkSurfaceOut)
+{
+    Q_UNUSED(vkInstance);
+    Q_UNUSED(vkGetInstanceProcAddrFn);
+    Q_UNUSED(vkSurfaceOut);
+    return false;
+}
+
+bool QPlatformWindow::checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
+                                                      quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn)
+{
+    Q_UNUSED(vkInstance);
+    Q_UNUSED(vkPhysicalDevice);
+    Q_UNUSED(queueFamilyIndex);
+    Q_UNUSED(vkGetInstanceProcAddrFn);
+    return false;
+}
+
+void QPlatformWindow::preparePhasedGpuPresent()
+{
+}
+
 /*!
     Delivers an QEvent::UpdateRequest event to the window.
 
