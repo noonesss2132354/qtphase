@@ -52,6 +52,7 @@
 #include <QtWaylandClient/private/qwayland-wp-primary-selection-unstable-v1.h>
 #include <QtWaylandClient/private/qwayland-qt-text-input-method-unstable-v1.h>
 #include <QtWaylandClient/private/qwayland-fractional-scale-v1.h>
+#include <QtWaylandClient/private/qwayland-linux-dmabuf-unstable-v1.h>
 #include <QtWaylandClient/private/qwayland-viewporter.h>
 #include <QtWaylandClient/private/qwayland-cursor-shape-v1.h>
 #include <QtWaylandClient/private/qwayland-xx-session-management-v1.h>
@@ -75,6 +76,36 @@
 QT_BEGIN_NAMESPACE
 
 namespace QtWaylandClient {
+
+class QWaylandLinuxDmabuf : public QtWayland::zwp_linux_dmabuf_v1
+{
+public:
+    QWaylandLinuxDmabuf(struct ::wl_registry *registry, uint32_t id, uint32_t version)
+        : QtWayland::zwp_linux_dmabuf_v1(registry, id, version)
+    {
+    }
+    ~QWaylandLinuxDmabuf() override
+    {
+        if (isInitialized())
+            destroy();
+    }
+
+    QHash<quint32, QList<quint64>> modifiersByFormat;
+
+protected:
+    void zwp_linux_dmabuf_v1_format(uint32_t format) override
+    {
+        modifiersByFormat[format];
+    }
+
+    void zwp_linux_dmabuf_v1_modifier(uint32_t format, uint32_t modifier_hi, uint32_t modifier_lo) override
+    {
+        const quint64 mod = (quint64(modifier_hi) << 32) | quint64(modifier_lo);
+        auto &list = modifiersByFormat[format];
+        if (!list.contains(mod))
+            list.push_back(mod);
+    }
+};
 
 class EventThread : public QThread
 {
@@ -302,6 +333,18 @@ struct ::wl_region *QWaylandDisplay::createRegion(const QRegion &qregion)
 
     Q_ASSERT(window->wlSurface());
     return mGlobals.viewporter->get_viewport(window->wlSurface());
+}
+
+QtWayland::zwp_linux_dmabuf_v1 *QWaylandDisplay::linuxDmabuf() const
+{
+    return mGlobals.linuxDmabuf.get();
+}
+
+QList<quint64> QWaylandDisplay::linuxDmabufModifiers(quint32 drmFormat) const
+{
+    if (!mGlobals.linuxDmabuf)
+        return {};
+    return mGlobals.linuxDmabuf->modifiersByFormat.value(drmFormat);
 }
 
 QWaylandShellIntegration *QWaylandDisplay::shellIntegration() const
@@ -790,6 +833,8 @@ void QWaylandDisplay::registry_global(uint32_t id, const QString &interface, uin
         mGlobals.viewporter.reset(
                 new WithDestructor<QtWayland::wp_viewporter, wp_viewporter_destroy>(
                         registry, id, qMin(1u, version)));
+    } else if (interface == QLatin1String("zwp_linux_dmabuf_v1")) {
+        mGlobals.linuxDmabuf = std::make_unique<QWaylandLinuxDmabuf>(registry, id, qMin(3u, version));
     } else if (interface == QLatin1String(QtWayland::wp_cursor_shape_manager_v1::interface()->name)) {
         mGlobals.cursorShapeManager.reset(new WithDestructor<QtWayland::wp_cursor_shape_manager_v1,
                                                              wp_cursor_shape_manager_v1_destroy>(

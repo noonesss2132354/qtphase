@@ -56,11 +56,11 @@ public:
     // Immediately syncs and dispatches a frame (used on Expose / Resize / UpdateNow)
     void presentNow();
 
-    // Called from QWidgetWindow::handleResizeEvent() to update expected Wayland size immediately
-    // and dispatch a zero-delay resize frame without waiting on UI Reflex!
+    // Called from QWidgetWindow::handleResizeEvent() to dispatch a zero-delay resize frame
+    // without waiting on UI Reflex!
     void presentResizeNow();
 
-    // Stops background workers before QWindow::destroy() tears down the platform surface
+    // Releases per-surface GPU buffers before QWindow hides or tears down the platform surface
     void onSurfaceHidden();
     void shutdown();
 
@@ -69,22 +69,23 @@ public:
     quint64 gpuFramesPresented() const noexcept;
 
 private:
-    void startEarlyGpuWarmupThread();
-    void ensureCpuBootThreadStarted();
-    void finalizeWorkerWinner(Phase winningPhase);
-    void onCpuWorkerFrameDone(quint64 seq,
-                              quint8 wonStreak,
-                              Phase lockedPhase,
-                              void *bufferHandle,
-                              qint64 cpuWorkUs,
-                              const QRegion &logicalSurfaceDamage);
-    void onGpuWorkerFrameDone(quint64 seq,
-                              quint8 wonStreak,
-                              Phase lockedPhase,
-                              qint64 gpuWorkUs,
-                              qint64 gpuHwUs,
-                              quint64 syncedBytes,
-                              quint64 uploadedImageGen);
+    void onProcessWarmupFinished();
+    bool ensureVulkanBackendReady();
+    void finalizeWinner(Phase winningPhase);
+    bool presentCpuFrame(QPlatformWindow *pw,
+                         const QSize &pxSize,
+                         qreal dpr,
+                         bool hasAlpha,
+                         uint64_t frameTimeNs,
+                         qint64 *outCpuWorkUs = nullptr);
+    bool presentGpuFrame(QPlatformWindow *pw,
+                         const QSize &pxSize,
+                         const QSize &logicalSize,
+                         qreal dpr,
+                         bool hasAlpha,
+                         uint64_t frameTimeNs,
+                         bool waitForGpuCompletion,
+                         qint64 *outGpuHwUs = nullptr);
 
     std::unique_ptr<QPhaseSurfacePresenterPrivate> d;
 };

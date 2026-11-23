@@ -181,12 +181,11 @@ void QWidgetRepaintManager::markDirty(const T &r, QWidget *widget, UpdateTime up
 
 #if QT_CONFIG(vulkan)
     if (QTLWExtra *td = tlw->d_func()->maybeTopData(); td && td->phaseBridge) {
-        if (bufferState == BufferInvalid) {
-            const QPoint off = (widget != tlw) ? widget->mapTo(tlw, QPoint()) : QPoint();
-            td->phaseBridge->markIntersectingDirty(QRegion(r).translated(off));
-        } else {
-            td->phaseBridge->markWidgetDirty(widget);
-        }
+        // Every widget owns an independent retained QWidgetPhaseNode (no shared raster backing store
+        // to invalidate), so a parent container BufferInvalid during resize should not force fixed-size
+        // children to repaint — syncWidgetRecursive() already repaints any child whose size() changed!
+        Q_UNUSED(bufferState);
+        td->phaseBridge->markWidgetDirty(widget);
         td->phaseBridge->scheduleUpdate(updateTime == UpdateNow);
         return;
     }

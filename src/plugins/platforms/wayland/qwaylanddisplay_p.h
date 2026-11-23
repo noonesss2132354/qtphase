@@ -57,6 +57,7 @@ namespace QtWayland {
     class wp_cursor_shape_manager_v1;
     class wp_fractional_scale_manager_v1;
     class wp_viewporter;
+    class zwp_linux_dmabuf_v1;
     class xx_session_manager_v1;
     class xdg_system_bell_v1;
     class xdg_toplevel_drag_manager_v1;
@@ -85,6 +86,7 @@ class QWaylandPrimarySelectionDeviceManagerV1;
 class QWaylandTabletManagerV2;
 #endif
 class QWaylandPointerGestures;
+class QWaylandLinuxDmabuf;
 class QWaylandWindow;
 class QWaylandIntegration;
 class QWaylandHardwareIntegration;
@@ -209,6 +211,8 @@ public:
     {
         return mGlobals.viewporter.get();
     }
+    QtWayland::zwp_linux_dmabuf_v1 *linuxDmabuf() const;
+    QList<quint64> linuxDmabufModifiers(quint32 drmFormat) const;
     QtWayland::wp_cursor_shape_manager_v1 *cursorShapeManager() const
     {
         return mGlobals.cursorShapeManager.get();
@@ -366,6 +370,7 @@ private:
         std::unique_ptr<QWaylandHardwareIntegration> hardwareIntegration;
         std::unique_ptr<QWaylandXdgOutputManagerV1> xdgOutputManager;
         std::unique_ptr<QtWayland::wp_viewporter> viewporter;
+        std::unique_ptr<QWaylandLinuxDmabuf> linuxDmabuf;
         std::unique_ptr<QtWayland::wp_fractional_scale_manager_v1> fractionalScaleManager;
         std::unique_ptr<QtWayland::wp_cursor_shape_manager_v1> cursorShapeManager;
         std::unique_ptr<QtWayland::xx_session_manager_v1> xxSessionManager;

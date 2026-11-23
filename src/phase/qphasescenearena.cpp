@@ -451,6 +451,27 @@ void QPhaseSceneArena::syncRootView(QPhaseView *rootView)
         setDrawOrder(std::move(order));
 }
 
+uint32_t QPhaseSceneArena::acquireFreeOrNewImageSlot(PhaseImageEntry &&entry)
+{
+    static constexpr uint64_t kSlotReuseCooldownFrames = 3;
+    static constexpr size_t kHighWaterMark = 3968;
+    if (!m_freeImageSlots.empty()) {
+        const PendingFreeImageSlot &front = m_freeImageSlots.front();
+        const bool cooledDown = (m_frameEpoch == 0)
+                || (m_frameEpoch >= front.freedEpoch + kSlotReuseCooldownFrames)
+                || (m_images.size() >= kHighWaterMark);
+        if (cooledDown) {
+            const uint32_t slot = front.slot;
+            m_freeImageSlots.pop_front();
+            m_images[slot] = std::move(entry);
+            return slot;
+        }
+    }
+    const uint32_t slot = uint32_t(m_images.size());
+    m_images.push_back(std::move(entry));
+    return slot;
+}
+
 uint32_t QPhaseSceneArena::allocateCpuBridgeSlot()
 {
     PhaseImageEntry entry{};
@@ -458,15 +479,7 @@ uint32_t QPhaseSceneArena::allocateCpuBridgeSlot()
     entry.uploadedToGpu = false;
     entry.active = true;
 
-    uint32_t slot = 0;
-    if (!m_freeImageSlots.empty()) {
-        slot = m_freeImageSlots.back();
-        m_freeImageSlots.pop_back();
-        m_images[slot] = std::move(entry);
-    } else {
-        slot = uint32_t(m_images.size());
-        m_images.push_back(std::move(entry));
-    }
+    const uint32_t slot = acquireFreeOrNewImageSlot(std::move(entry));
     ++m_imageTableRevision;
     ++m_revision;
     return slot;
@@ -491,16 +504,7 @@ uint32_t QPhaseSceneArena::allocateGpuSurface(int logicalWidth, int logicalHeigh
     entry.uploadedToGpu = false;
     entry.active = true;
 
-    uint32_t slot = 0;
-    if (!m_freeImageSlots.empty()) {
-        slot = m_freeImageSlots.back();
-        m_freeImageSlots.pop_back();
-        m_images[slot] = std::move(entry);
-    } else {
-        slot = uint32_t(m_images.size());
-        m_images.push_back(std::move(entry));
-    }
-
+    const uint32_t slot = acquireFreeOrNewImageSlot(std::move(entry));
     ++m_imageTableRevision;
     ++m_revision;
     return slot;
@@ -558,15 +562,7 @@ uint32_t QPhaseSceneArena::registerOrGetImage(const QImage &image)
     entry.uploadedToGpu = false;
     entry.active = true;
 
-    uint32_t slot = 0;
-    if (!m_freeImageSlots.empty()) {
-        slot = m_freeImageSlots.back();
-        m_freeImageSlots.pop_back();
-        m_images[slot] = std::move(entry);
-    } else {
-        slot = uint32_t(m_images.size());
-        m_images.push_back(std::move(entry));
-    }
+    const uint32_t slot = acquireFreeOrNewImageSlot(std::move(entry));
 
     m_imageCacheMap.insert(key, slot);
     ++m_imageTableRevision;
@@ -590,7 +586,7 @@ void QPhaseSceneArena::unregisterImage(uint32_t slot)
     e.active = false;
     e.generation = ++m_nextImageGen;
     m_cpuBridgeCache.remove(slot);
-    m_freeImageSlots.push_back(slot);
+    m_freeImageSlots.push_back({ slot, m_frameEpoch });
     ++m_imageTableRevision;
     ++m_revision;
 }

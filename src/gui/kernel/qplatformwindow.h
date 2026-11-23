@@ -129,9 +129,28 @@ public:
         void *handle = nullptr;
     };
 
+    struct PhasedDmaBufDesc {
+        int fd = -1;
+        int bufferWidth = 0;
+        int bufferHeight = 0;
+        quint32 drmFormat = 0;
+        quint32 offset = 0;
+        quint32 stride = 0;
+        quint64 modifier = 0;
+    };
+
     virtual bool acquirePhasedBootBuffer(const QSize &pixelSize, qreal dpr, PhasedBootBuffer *outBuffer);
     virtual void presentPhasedBootBuffer(void *bufferHandle, const QRegion &damage);
     virtual void releasePhasedBootResources();
+    virtual bool supportsPhasedDmaBuf() const;
+    virtual QList<quint64> phasedDmaBufModifiers(quint32 drmFormat) const;
+    virtual void *createPhasedDmaBufBuffer(const PhasedDmaBufDesc &desc);
+    virtual void destroyPhasedDmaBufBuffer(void *bufferHandle);
+    virtual bool isPhasedDmaBufBufferBusy(void *bufferHandle) const;
+    virtual void presentPhasedDmaBufBuffer(void *bufferHandle,
+                                           const QSize &pixelSize,
+                                           const QSize &logicalSize,
+                                           const QRegion &bufferPixelDamage);
     virtual bool createPhasedVulkanSurface(void *vkInstance, void *vkGetInstanceProcAddrFn, void *vkSurfaceOut);
     virtual bool checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
                                                  quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn);

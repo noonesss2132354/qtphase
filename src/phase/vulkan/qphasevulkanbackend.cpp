@@ -35,6 +35,12 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef Q_OS_LINUX
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 QT_BEGIN_NAMESPACE
 
 namespace {
@@ -45,6 +51,9 @@ static constexpr uint32_t kTileSize = 16;
 static constexpr uint32_t kGlyphAtlasWidth = 2048;  // Shared 2048x2048 R8_UNORM = 4 MB process-wide VRAM atlas!
 static constexpr uint32_t kGlyphAtlasHeight = 2048;
 static constexpr int kMaxCachedGlyphDim = 1024;     // Bakes ALL glyphs & large/rotated SVG icons via 8x8 blocks!
+static constexpr uint32_t kDrmFormatXrgb8888 = 0x34325258u; // DRM_FORMAT_XRGB8888 ('X','R','2','4')
+static constexpr uint32_t kDrmFormatArgb8888 = 0x34325241u; // DRM_FORMAT_ARGB8888 ('A','R','2','4')
+static constexpr uint32_t kMaxDmaBufRingSlots = 4u;
 
 struct GpuGlyphBakeCmd {
     uint32_t curveTexelOffset = 0;
@@ -239,8 +248,14 @@ struct QPhaseSharedVulkanDevice {
     bool supportsTimestamps = false;
     bool hasSwapchainExt = false;
     bool hasIncrementalPresent = false;
+    bool hasDmaBufExport = false;
+    bool hasSyncFdExport = false;
     bool isHardwareGpu = false;
     std::atomic<bool> pipelinesWarmedUp{false};
+
+    PFN_vkGetMemoryFdKHR pfnGetMemoryFdKHR = nullptr;
+    PFN_vkGetImageDrmFormatModifierPropertiesEXT pfnGetImageDrmFormatModifierPropertiesEXT = nullptr;
+    PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFdKHR = nullptr;
 
     VkSampler linearSampler = VK_NULL_HANDLE;
     VkSampler nearestSampler = VK_NULL_HANDLE;
@@ -465,7 +480,11 @@ struct QPhaseSharedVulkanDevice {
         feat2.features.shaderInt64 = VK_TRUE;
 
         std::vector<const char *> deviceExts;
-        if (!instanceExts.empty()) {
+        bool hasExtMemFd = false;
+        bool hasExtMemDmaBuf = false;
+        bool hasDrmModifier = false;
+        bool hasExtSemFd = false;
+        {
             uint32_t extCount = 0;
             if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, nullptr) == VK_SUCCESS && extCount > 0) {
                 std::vector<VkExtensionProperties> availExts(extCount);
@@ -475,16 +494,31 @@ struct QPhaseSharedVulkanDevice {
                         hasSwapchainExt = true;
                     else if (std::strcmp(ep.extensionName, VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME) == 0)
                         hasIncrementalPresent = true;
+                    else if (std::strcmp(ep.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0)
+                        hasExtMemFd = true;
+                    else if (std::strcmp(ep.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0)
+                        hasExtMemDmaBuf = true;
+                    else if (std::strcmp(ep.extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0)
+                        hasDrmModifier = true;
+                    else if (std::strcmp(ep.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME) == 0)
+                        hasExtSemFd = true;
                 }
             }
-            if (hasSwapchainExt) {
+            if (!instanceExts.empty() && hasSwapchainExt) {
                 deviceExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
                 if (hasIncrementalPresent)
                     deviceExts.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
             }
+            if (hasExtMemFd && hasExtMemDmaBuf && hasDrmModifier) {
+                deviceExts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+                deviceExts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+                deviceExts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+            }
+            if (hasExtSemFd)
+                deviceExts.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
         }
 
-        if (requireWaylandWsi && !hasSwapchainExt)
+        if (requireWaylandWsi && !hasSwapchainExt && !(hasExtMemFd && hasExtMemDmaBuf && hasDrmModifier))
             return false;
 
         VkDeviceCreateInfo devInfo{};
@@ -498,6 +532,27 @@ struct QPhaseSharedVulkanDevice {
         if (vkCreateDevice(physDevice, &devInfo, nullptr, &device) != VK_SUCCESS) {
             qWarning("QtPhase: vkCreateDevice failed");
             return false;
+        }
+
+        if (hasExtMemFd && hasExtMemDmaBuf && hasDrmModifier) {
+            pfnGetMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+                    vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR"));
+            pfnGetImageDrmFormatModifierPropertiesEXT = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
+                    vkGetDeviceProcAddr(device, "vkGetImageDrmFormatModifierPropertiesEXT"));
+            hasDmaBufExport = (pfnGetMemoryFdKHR != nullptr && pfnGetImageDrmFormatModifierPropertiesEXT != nullptr);
+        }
+        if (hasExtSemFd) {
+            pfnGetSemaphoreFdKHR = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+                    vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
+            if (pfnGetSemaphoreFdKHR) {
+                VkPhysicalDeviceExternalSemaphoreInfo esi{};
+                esi.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO;
+                esi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+                VkExternalSemaphoreProperties esp{};
+                esp.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
+                vkGetPhysicalDeviceExternalSemaphoreProperties(physDevice, &esi, &esp);
+                hasSyncFdExport = (esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) != 0;
+            }
         }
 
         vkGetDeviceQueue(device, graphicsQueueFamily, 0, &graphicsQueue);
@@ -889,7 +944,7 @@ struct QPhaseSharedVulkanDevice {
     {
         std::lock_guard<std::mutex> lock(sharedMutex());
         if (auto existing = sharedWeak().lock())
-            return existing->hasSwapchainExt && existing->isHardwareGpu;
+            return (existing->hasSwapchainExt || existing->hasDmaBufExport) && existing->isHardwareGpu;
         return false;
     }
 
@@ -897,7 +952,7 @@ struct QPhaseSharedVulkanDevice {
     {
         std::lock_guard<std::mutex> lock(sharedMutex());
         if (auto existing = sharedWeak().lock()) {
-            if (!requireWaylandWsi || existing->hasSwapchainExt) {
+            if (!requireWaylandWsi || existing->hasSwapchainExt || existing->hasDmaBufExport) {
                 if (outCacheHit)
                     *outCacheHit = true;
                 return existing;
@@ -1049,11 +1104,41 @@ struct QPhaseVulkanBackendData {
         std::vector<VkSemaphore> sems;
         uint64_t retireAfterSeq = 0;
     };
+    struct DmaBufRingSlot {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSemaphore exportSyncSem = VK_NULL_HANDLE;
+        int dmabufFd = -1;
+        void *wlBufferHandle = nullptr;
+        QSize bucketSize;
+        bool hasAlpha = false;
+        bool initializedLayout = false;
+        uint64_t lastSubmitSeq = 0;
+        QPhaseDamageTracker damageTracker;
+    };
+    struct RetiredDmaBuf {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSemaphore exportSyncSem = VK_NULL_HANDLE;
+        int dmabufFd = -1;
+        uint64_t retireAfterSeq = 0;
+    };
     uint64_t nextSubmitSeq = 0;
     uint64_t completedSubmitSeq = 0;
     std::vector<RetiredGpuBuffer> retiredBuffers;
     std::vector<RetiredGpuImage> retiredImages;
     std::vector<RetiredSwapchain> retiredSwapchains;
+    std::vector<RetiredDmaBuf> retiredDmaBufs;
+
+    // Zero-swapchain bucketed DMA-BUF ring for atomic main-thread Wayland presentation!
+    std::vector<DmaBufRingSlot> dmabufRing;
+    QSize dmabufBucketSize;
+    bool dmabufHasAlpha = false;
+    bool dmabufModifierCached = false;
+    bool dmabufModifierHasAlpha = false;
+    uint64_t dmabufChosenModifier = 0;
 
     std::atomic<quint64> glyphCacheHits{0};
     std::atomic<quint64> glyphCacheMisses{0};
@@ -1146,6 +1231,27 @@ static void reclaimCompletedResources(QPhaseVulkanBackendData *d)
             ++scIt;
         }
     }
+
+    auto dbIt = d->retiredDmaBufs.begin();
+    while (dbIt != d->retiredDmaBufs.end()) {
+        if (dbIt->retireAfterSeq <= d->completedSubmitSeq) {
+            if (dbIt->view != VK_NULL_HANDLE)
+                vkDestroyImageView(dev, dbIt->view, nullptr);
+            if (dbIt->image != VK_NULL_HANDLE)
+                vkDestroyImage(dev, dbIt->image, nullptr);
+            if (dbIt->memory != VK_NULL_HANDLE)
+                vkFreeMemory(dev, dbIt->memory, nullptr);
+            if (dbIt->exportSyncSem != VK_NULL_HANDLE)
+                vkDestroySemaphore(dev, dbIt->exportSyncSem, nullptr);
+#ifdef Q_OS_LINUX
+            if (dbIt->dmabufFd >= 0)
+                ::close(dbIt->dmabufFd);
+#endif
+            dbIt = d->retiredDmaBufs.erase(dbIt);
+        } else {
+            ++dbIt;
+        }
+    }
 }
 
 static void waitAllBackendFramesIdle(QPhaseVulkanBackendData *d)
@@ -1225,6 +1331,22 @@ QPhaseVulkanBackend::~QPhaseVulkanBackend()
         if (d->raceImage != VK_NULL_HANDLE)
             vmaDestroyImage(alloc, d->raceImage, d->raceAlloc);
 
+        for (auto &slot : d->dmabufRing) {
+            if (slot.view != VK_NULL_HANDLE)
+                vkDestroyImageView(dev, slot.view, nullptr);
+            if (slot.image != VK_NULL_HANDLE)
+                vkDestroyImage(dev, slot.image, nullptr);
+            if (slot.memory != VK_NULL_HANDLE)
+                vkFreeMemory(dev, slot.memory, nullptr);
+            if (slot.exportSyncSem != VK_NULL_HANDLE)
+                vkDestroySemaphore(dev, slot.exportSyncSem, nullptr);
+#ifdef Q_OS_LINUX
+            if (slot.dmabufFd >= 0)
+                ::close(slot.dmabufFd);
+#endif
+        }
+        d->dmabufRing.clear();
+
         if (d->surface != VK_NULL_HANDLE)
             vkDestroySurfaceKHR(d->shared->instance, d->surface, nullptr);
     }
@@ -1243,6 +1365,11 @@ bool QPhaseVulkanBackend::isDeviceReady() const noexcept
 bool QPhaseVulkanBackend::isHardwareGpu() const noexcept
 {
     return d->shared && d->shared->isHardwareGpu;
+}
+
+bool QPhaseVulkanBackend::supportsDmaBufExport() const noexcept
+{
+    return d->shared && d->shared->hasDmaBufExport;
 }
 
 bool QPhaseVulkanBackend::usedSharedDeviceCache() const noexcept
@@ -2781,8 +2908,8 @@ static void recordDrawCommands(QPhaseVulkanBackendData *d,
     inBarrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
             | (preserveExistingColor ? VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT : 0);
     inBarrier.oldLayout = preserveExistingColor
-            ? ((finalLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-               ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            ? ((finalLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || finalLayout == VK_IMAGE_LAYOUT_GENERAL)
+               ? finalLayout
                : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
             : VK_IMAGE_LAYOUT_UNDEFINED;
     inBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -3297,6 +3424,587 @@ bool QPhaseVulkanBackend::renderAndPresentWindow(QPlatformWindow *platformWindow
         d->swapchainNeedsRecreate = true;
 
     return presRes == VK_SUCCESS || presRes == VK_SUBOPTIMAL_KHR;
+}
+
+static QSize bucketizeDmaBufSize(const QSize &px) noexcept
+{
+    auto roundUp = [](int v) -> int {
+        if (v <= 64)
+            return 64;
+        if (v <= 128)
+            return 128;
+        if (v <= 256)
+            return 256;
+        return (v + 255) & ~255;
+    };
+    return QSize(roundUp(std::max(1, px.width())), roundUp(std::max(1, px.height())));
+}
+
+static bool selectDmaBufModifier(QPhaseVulkanBackendData *d,
+                                 QPlatformWindow *platformWindow,
+                                 bool hasAlpha,
+                                 uint64_t *outModifier)
+{
+    if (!d || !d->shared || !platformWindow || !outModifier)
+        return false;
+    if (d->dmabufModifierCached && d->dmabufModifierHasAlpha == hasAlpha) {
+        *outModifier = d->dmabufChosenModifier;
+        return true;
+    }
+
+    VkPhysicalDevice phys = d->shared->physDevice;
+    const uint32_t drmFmt = hasAlpha ? kDrmFormatArgb8888 : kDrmFormatXrgb8888;
+    const QList<quint64> compMods = platformWindow->phasedDmaBufModifiers(drmFmt);
+
+    VkDrmFormatModifierPropertiesListEXT modList{};
+    modList.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
+    VkFormatProperties2 fp2{};
+    fp2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    fp2.pNext = &modList;
+    vkGetPhysicalDeviceFormatProperties2(phys, VK_FORMAT_B8G8R8A8_UNORM, &fp2);
+    if (modList.drmFormatModifierCount == 0)
+        return false;
+
+    std::vector<VkDrmFormatModifierPropertiesEXT> gpuMods(modList.drmFormatModifierCount);
+    modList.pDrmFormatModifierProperties = gpuMods.data();
+    vkGetPhysicalDeviceFormatProperties2(phys, VK_FORMAT_B8G8R8A8_UNORM, &fp2);
+
+    auto supportsExport = [&](uint64_t mod) -> bool {
+        VkPhysicalDeviceImageDrmFormatModifierInfoEXT modInfo{};
+        modInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
+        modInfo.drmFormatModifier = mod;
+        modInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkPhysicalDeviceExternalImageFormatInfo extInfo{};
+        extInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+        extInfo.pNext = &modInfo;
+        extInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+        VkPhysicalDeviceImageFormatInfo2 imgFmtInfo{};
+        imgFmtInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        imgFmtInfo.pNext = &extInfo;
+        imgFmtInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        imgFmtInfo.type = VK_IMAGE_TYPE_2D;
+        imgFmtInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        imgFmtInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+        VkExternalImageFormatProperties extProps{};
+        extProps.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+        VkImageFormatProperties2 fmtProps{};
+        fmtProps.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        fmtProps.pNext = &extProps;
+
+        if (vkGetPhysicalDeviceImageFormatProperties2(phys, &imgFmtInfo, &fmtProps) != VK_SUCCESS)
+            return false;
+        return (extProps.externalMemoryProperties.externalMemoryFeatures
+                & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0;
+    };
+
+    bool foundTiled = false;
+    uint64_t tiledMod = 0;
+    bool foundLinear = false;
+
+    for (const VkDrmFormatModifierPropertiesEXT &m : gpuMods) {
+        if (m.drmFormatModifierPlaneCount != 1u)
+            continue;
+        if ((m.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0u)
+            continue;
+        const bool compAccepts = compMods.isEmpty() || compMods.contains(quint64(m.drmFormatModifier));
+        if (!compAccepts)
+            continue;
+        if (!supportsExport(m.drmFormatModifier))
+            continue;
+        if (m.drmFormatModifier == 0ULL) {
+            foundLinear = true;
+        } else if (!foundTiled) {
+            foundTiled = true;
+            tiledMod = m.drmFormatModifier;
+        }
+    }
+
+    if (!foundTiled && !foundLinear)
+        return false;
+
+    d->dmabufChosenModifier = foundTiled ? tiledMod : 0ULL;
+    d->dmabufModifierHasAlpha = hasAlpha;
+    d->dmabufModifierCached = true;
+    *outModifier = d->dmabufChosenModifier;
+    return true;
+}
+
+static bool allocateDmaBufSlot(QPhaseVulkanBackendData *d,
+                               QPlatformWindow *platformWindow,
+                               const QSize &bucketSize,
+                               bool hasAlpha,
+                               uint64_t modifier,
+                               QPhaseVulkanBackendData::DmaBufRingSlot *outSlot)
+{
+#ifdef Q_OS_LINUX
+    if (!d || !d->shared || !d->shared->hasDmaBufExport || !platformWindow || !outSlot)
+        return false;
+
+    VkDevice dev = d->shared->device;
+    VkPhysicalDevice phys = d->shared->physDevice;
+    const uint32_t drmFmt = hasAlpha ? kDrmFormatArgb8888 : kDrmFormatXrgb8888;
+
+    VkImageDrmFormatModifierListCreateInfoEXT modCreateInfo{};
+    modCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+    modCreateInfo.drmFormatModifierCount = 1;
+    modCreateInfo.pDrmFormatModifiers = &modifier;
+
+    VkExternalMemoryImageCreateInfo extImgInfo{};
+    extImgInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    extImgInfo.pNext = &modCreateInfo;
+    extImgInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.pNext = &extImgInfo;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+    imgInfo.extent = { uint32_t(bucketSize.width()), uint32_t(bucketSize.height()), 1 };
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    QPhaseVulkanBackendData::DmaBufRingSlot slot{};
+    slot.bucketSize = bucketSize;
+    slot.hasAlpha = hasAlpha;
+
+    auto cleanup = [&]() {
+        if (slot.wlBufferHandle)
+            platformWindow->destroyPhasedDmaBufBuffer(slot.wlBufferHandle);
+        if (slot.exportSyncSem != VK_NULL_HANDLE)
+            vkDestroySemaphore(dev, slot.exportSyncSem, nullptr);
+        if (slot.view != VK_NULL_HANDLE)
+            vkDestroyImageView(dev, slot.view, nullptr);
+        if (slot.image != VK_NULL_HANDLE)
+            vkDestroyImage(dev, slot.image, nullptr);
+        if (slot.memory != VK_NULL_HANDLE)
+            vkFreeMemory(dev, slot.memory, nullptr);
+        if (slot.dmabufFd >= 0)
+            ::close(slot.dmabufFd);
+    };
+
+    if (vkCreateImage(dev, &imgInfo, nullptr, &slot.image) != VK_SUCCESS)
+        return false;
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(dev, slot.image, &memReq);
+
+    VkPhysicalDeviceMemoryProperties memProps{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
+    uint32_t chosenMemType = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1u << i)) != 0u
+            && (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0u) {
+            chosenMemType = i;
+            break;
+        }
+    }
+    if (chosenMemType == UINT32_MAX) {
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1u << i)) != 0u) {
+                chosenMemType = i;
+                break;
+            }
+        }
+    }
+    if (chosenMemType == UINT32_MAX) {
+        cleanup();
+        return false;
+    }
+
+    VkMemoryDedicatedAllocateInfo dedInfo{};
+    dedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedInfo.image = slot.image;
+
+    VkExportMemoryAllocateInfo expAllocInfo{};
+    expAllocInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    expAllocInfo.pNext = &dedInfo;
+    expAllocInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.pNext = &expAllocInfo;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = chosenMemType;
+
+    if (vkAllocateMemory(dev, &allocInfo, nullptr, &slot.memory) != VK_SUCCESS) {
+        cleanup();
+        return false;
+    }
+    if (vkBindImageMemory(dev, slot.image, slot.memory, 0) != VK_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    VkImageViewCreateInfo ivInfo{};
+    ivInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivInfo.image = slot.image;
+    ivInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ivInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    if (vkCreateImageView(dev, &ivInfo, nullptr, &slot.view) != VK_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    if (d->shared->hasSyncFdExport) {
+        VkExportSemaphoreCreateInfo expSem{};
+        expSem.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        expSem.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        VkSemaphoreCreateInfo semInfo{};
+        semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        semInfo.pNext = &expSem;
+        if (vkCreateSemaphore(dev, &semInfo, nullptr, &slot.exportSyncSem) != VK_SUCCESS) {
+            cleanup();
+            return false;
+        }
+    }
+
+    VkImageDrmFormatModifierPropertiesEXT actualMod{};
+    actualMod.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
+    if (d->shared->pfnGetImageDrmFormatModifierPropertiesEXT(dev, slot.image, &actualMod) != VK_SUCCESS) {
+        cleanup();
+        return false;
+    }
+
+    VkImageSubresource sub{};
+    sub.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
+    sub.mipLevel = 0;
+    sub.arrayLayer = 0;
+    VkSubresourceLayout layout{};
+    vkGetImageSubresourceLayout(dev, slot.image, &sub, &layout);
+
+    VkMemoryGetFdInfoKHR fdInfo{};
+    fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    fdInfo.memory = slot.memory;
+    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    if (d->shared->pfnGetMemoryFdKHR(dev, &fdInfo, &slot.dmabufFd) != VK_SUCCESS || slot.dmabufFd < 0) {
+        cleanup();
+        return false;
+    }
+
+    QPlatformWindow::PhasedDmaBufDesc desc{};
+    desc.fd = slot.dmabufFd;
+    desc.bufferWidth = bucketSize.width();
+    desc.bufferHeight = bucketSize.height();
+    desc.drmFormat = drmFmt;
+    desc.offset = uint32_t(layout.offset);
+    desc.stride = uint32_t(layout.rowPitch);
+    desc.modifier = actualMod.drmFormatModifier;
+
+    slot.wlBufferHandle = platformWindow->createPhasedDmaBufBuffer(desc);
+    if (!slot.wlBufferHandle) {
+        cleanup();
+        return false;
+    }
+
+    *outSlot = std::move(slot);
+    return true;
+#else
+    Q_UNUSED(d);
+    Q_UNUSED(platformWindow);
+    Q_UNUSED(bucketSize);
+    Q_UNUSED(hasAlpha);
+    Q_UNUSED(modifier);
+    Q_UNUSED(outSlot);
+    return false;
+#endif
+}
+
+void QPhaseVulkanBackend::releaseDmaBufRing(QPlatformWindow *platformWindow)
+{
+    if (!d)
+        return;
+    for (auto &slot : d->dmabufRing) {
+        if (platformWindow && slot.wlBufferHandle)
+            platformWindow->destroyPhasedDmaBufBuffer(slot.wlBufferHandle);
+        slot.wlBufferHandle = nullptr;
+        d->retiredDmaBufs.push_back({
+            slot.image, slot.memory, slot.view, slot.exportSyncSem, slot.dmabufFd, d->nextSubmitSeq
+        });
+    }
+    d->dmabufRing.clear();
+    d->dmabufBucketSize = QSize();
+    d->presentSurfaceTracker.reset();
+}
+
+bool QPhaseVulkanBackend::renderAndPresentDmaBuf(QPlatformWindow *platformWindow,
+                                                 QPhaseSceneArena &arena,
+                                                 const QSize &pixelSize,
+                                                 const QSize &logicalSize,
+                                                 qreal devicePixelRatio,
+                                                 bool hasAlpha,
+                                                 uint64_t frameTimeNs,
+                                                 GpuFrameMetrics *outMetrics,
+                                                 bool waitForGpuCompletion)
+{
+#ifdef Q_OS_LINUX
+    if (!d->deviceReady || !d->shared || !d->shared->hasDmaBufExport
+        || !platformWindow || pixelSize.isEmpty() || logicalSize.isEmpty()) {
+        return false;
+    }
+
+    static const bool sProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0;
+    QElapsedTimer submitTimer;
+    submitTimer.start();
+    qint64 allocUs = 0;
+
+    // Bucketed 256px sizing with 4x shrink hysteresis -> 0 allocations across drag-resizes!
+    const QSize targetBucket = bucketizeDmaBufSize(pixelSize);
+    const bool bucketFits = !d->dmabufBucketSize.isEmpty()
+            && d->dmabufHasAlpha == hasAlpha
+            && pixelSize.width() <= d->dmabufBucketSize.width()
+            && pixelSize.height() <= d->dmabufBucketSize.height();
+    const qint64 curArea = qint64(d->dmabufBucketSize.width()) * qint64(d->dmabufBucketSize.height());
+    const qint64 targetArea = qint64(targetBucket.width()) * qint64(targetBucket.height());
+    const bool shouldShrink = bucketFits && (curArea > targetArea * 4) && (curArea > 512LL * 512LL);
+
+    if (!bucketFits || shouldShrink) {
+        releaseDmaBufRing(platformWindow);
+        d->dmabufBucketSize = targetBucket;
+        d->dmabufHasAlpha = hasAlpha;
+    }
+
+    uint64_t chosenMod = 0;
+    if (!selectDmaBufModifier(d.get(), platformWindow, hasAlpha, &chosenMod))
+        return false;
+
+    const uint32_t frameSlotIdx = d->currentFrame;
+    FrameSlot &f = d->frames[frameSlotIdx];
+    vkWaitForFences(d->shared->device, 1, &f.inFlightFence, VK_TRUE, UINT64_MAX);
+    d->completedSubmitSeq = std::max(d->completedSubmitSeq, f.submittedSeq);
+    reclaimCompletedResources(d.get());
+    const qint64 tAfterFence = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+
+    qint64 gpuHwUs = f.hasValidTimestamps ? readSlotTimestampDurationUs(d.get(), frameSlotIdx)
+                                          : d->lastCompletedGpuHwUs;
+
+    // Pick an idle DMA-BUF ring slot (prefer one whose wl_buffer is released & GPU finished)
+    int chosenRingIdx = -1;
+    uint64_t bestSeq = UINT64_MAX;
+    for (size_t i = 0; i < d->dmabufRing.size(); ++i) {
+        const auto &s = d->dmabufRing[i];
+        if (!platformWindow->isPhasedDmaBufBufferBusy(s.wlBufferHandle)
+            && s.lastSubmitSeq <= d->completedSubmitSeq
+            && s.lastSubmitSeq < bestSeq) {
+            bestSeq = s.lastSubmitSeq;
+            chosenRingIdx = int(i);
+        }
+    }
+    if (chosenRingIdx < 0 && d->dmabufRing.size() < kMaxDmaBufRingSlots) {
+        QElapsedTimer allocT;
+        if (sProfile)
+            allocT.start();
+        QPhaseVulkanBackendData::DmaBufRingSlot newSlot{};
+        if (!allocateDmaBufSlot(d.get(), platformWindow, d->dmabufBucketSize, hasAlpha, chosenMod, &newSlot))
+            return false;
+        d->dmabufRing.push_back(std::move(newSlot));
+        chosenRingIdx = int(d->dmabufRing.size()) - 1;
+        if (sProfile)
+            allocUs = allocT.nsecsElapsed() / 1000;
+    }
+    if (chosenRingIdx < 0) {
+        for (size_t i = 0; i < d->dmabufRing.size(); ++i) {
+            const auto &s = d->dmabufRing[i];
+            if (!platformWindow->isPhasedDmaBufBufferBusy(s.wlBufferHandle)
+                && s.lastSubmitSeq < bestSeq) {
+                bestSeq = s.lastSubmitSeq;
+                chosenRingIdx = int(i);
+            }
+        }
+    }
+    if (chosenRingIdx < 0) {
+        for (size_t i = 0; i < d->dmabufRing.size(); ++i) {
+            if (d->dmabufRing[i].lastSubmitSeq < bestSeq) {
+                bestSeq = d->dmabufRing[i].lastSubmitSeq;
+                chosenRingIdx = int(i);
+            }
+        }
+    }
+    if (chosenRingIdx < 0)
+        return false;
+
+    auto &ringSlot = d->dmabufRing[size_t(chosenRingIdx)];
+    // Never reuse ringSlot.image or ringSlot.exportSyncSem while a prior GPU submission is still executing on it!
+    if (ringSlot.lastSubmitSeq > d->completedSubmitSeq) {
+        for (uint32_t j = 0; j < kFramesInFlight; ++j) {
+            if (j == frameSlotIdx)
+                continue;
+            if (d->frames[j].submittedSeq >= ringSlot.lastSubmitSeq && d->frames[j].inFlightFence != VK_NULL_HANDLE) {
+                vkWaitForFences(d->shared->device, 1, &d->frames[j].inFlightFence, VK_TRUE, UINT64_MAX);
+                d->completedSubmitSeq = std::max(d->completedSubmitSeq, d->frames[j].submittedSeq);
+            }
+        }
+        reclaimCompletedResources(d.get());
+    }
+    const qint64 tAfterSlot = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+
+    quint64 syncedBytes = 0;
+    if (!syncArenaToGpu(arena, frameSlotIdx, devicePixelRatio, frameTimeNs, &syncedBytes))
+        return false;
+
+    const VkExtent2D extent{ uint32_t(pixelSize.width()), uint32_t(pixelSize.height()) };
+    if (!ensureFrameWorkBuffer(d.get(), f, extent, f.drawCount))
+        return false;
+    const qint64 tAfterSync = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+
+    QRegion bufferDamage;
+    QRegion surfaceDamage;
+    bool isFullBufferDmg = true;
+    bool isFullSurfaceDmg = true;
+
+    if (ringSlot.initializedLayout
+        && ringSlot.damageTracker.isUnchanged(arena, pixelSize, devicePixelRatio)
+        && d->presentSurfaceTracker.isUnchanged(arena, pixelSize, devicePixelRatio)) {
+        isFullBufferDmg = false;
+        isFullSurfaceDmg = false;
+    } else {
+        const QPhaseDamageFrameSnapshot snap = QPhaseDamageFrameSnapshot::capture(
+                arena, pixelSize, devicePixelRatio, frameTimeNs, QPhaseRendererAffinity::GpuOnly);
+        bufferDamage = ringSlot.damageTracker.diffAndAdvance(snap, &isFullBufferDmg);
+        surfaceDamage = d->presentSurfaceTracker.diffAndAdvance(snap, &isFullSurfaceDmg);
+        if (!ringSlot.initializedLayout)
+            isFullBufferDmg = true;
+    }
+    const quint64 damagedPx = QPhaseDamageTracker::regionPixelArea(surfaceDamage);
+
+    vkResetFences(d->shared->device, 1, &f.inFlightFence);
+    vkResetCommandBuffer(f.cmdBuf, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(f.cmdBuf, &beginInfo);
+
+    recordDrawCommands(d.get(),
+                       frameSlotIdx,
+                       ringSlot.image,
+                       ringSlot.view,
+                       extent,
+                       VK_IMAGE_LAYOUT_GENERAL,
+                       arena.clearColor(),
+                       arena.textStemDarkening(),
+                       !hasAlpha,
+                       f,
+                       devicePixelRatio,
+                       frameTimeNs,
+                       !isFullBufferDmg && ringSlot.initializedLayout,
+                       isFullBufferDmg ? nullptr : &bufferDamage);
+
+    vkEndCommandBuffer(f.cmdBuf);
+
+    VkCommandBufferSubmitInfo cmdSubmit{};
+    cmdSubmit.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdSubmit.commandBuffer = f.cmdBuf;
+
+    VkSemaphoreSubmitInfo sigSem{};
+    sigSem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    sigSem.semaphore = ringSlot.exportSyncSem;
+    sigSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    const bool useExportSync = d->shared->hasSyncFdExport && (ringSlot.exportSyncSem != VK_NULL_HANDLE);
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmit;
+    if (useExportSync) {
+        submitInfo.signalSemaphoreInfoCount = 1;
+        submitInfo.pSignalSemaphoreInfos = &sigSem;
+    }
+
+    f.submittedSeq = ++d->nextSubmitSeq;
+    ringSlot.lastSubmitSeq = f.submittedSeq;
+    ringSlot.initializedLayout = true;
+    {
+        std::lock_guard<std::mutex> qlock(d->shared->queueMutex);
+        if (vkQueueSubmit2(d->shared->graphicsQueue, 1, &submitInfo, f.inFlightFence) != VK_SUCCESS)
+            return false;
+    }
+
+    bool importedSyncFd = false;
+    if (useExportSync) {
+        VkSemaphoreGetFdInfoKHR getFd{};
+        getFd.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+        getFd.semaphore = ringSlot.exportSyncSem;
+        getFd.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        int syncFd = -1;
+        if (d->shared->pfnGetSemaphoreFdKHR(d->shared->device, &getFd, &syncFd) == VK_SUCCESS) {
+            if (syncFd >= 0) {
+                struct dma_buf_import_sync_file imp{};
+                imp.flags = DMA_BUF_SYNC_WRITE;
+                imp.fd = syncFd;
+                if (::ioctl(ringSlot.dmabufFd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &imp) == 0)
+                    importedSyncFd = true;
+                ::close(syncFd);
+            } else {
+                // Already signaled on the GPU!
+                importedSyncFd = true;
+            }
+        }
+    }
+
+    if (waitForGpuCompletion || !importedSyncFd) {
+        vkWaitForFences(d->shared->device, 1, &f.inFlightFence, VK_TRUE, UINT64_MAX);
+        d->completedSubmitSeq = std::max(d->completedSubmitSeq, f.submittedSeq);
+        reclaimCompletedResources(d.get());
+        if (f.hasValidTimestamps)
+            gpuHwUs = readSlotTimestampDurationUs(d.get(), frameSlotIdx);
+    }
+
+    const qint64 tBeforePres = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+    const QRegion presentDmg = isFullSurfaceDmg
+            ? QRegion(QRect(0, 0, pixelSize.width(), pixelSize.height()))
+            : surfaceDamage;
+    platformWindow->presentPhasedDmaBufBuffer(ringSlot.wlBufferHandle, pixelSize, logicalSize, presentDmg);
+    const qint64 tAfterPres = sProfile ? (submitTimer.nsecsElapsed() / 1000) : 0;
+
+    d->currentFrame = (frameSlotIdx + 1) % kFramesInFlight;
+
+    if (outMetrics) {
+        outMetrics->cpuSubmitWorkUs = submitTimer.nsecsElapsed() / 1000;
+        outMetrics->gpuHardwareUs = (gpuHwUs > 0) ? gpuHwUs : outMetrics->cpuSubmitWorkUs;
+        outMetrics->damagedPixels = damagedPx;
+        outMetrics->syncedSceneBytes = syncedBytes;
+        outMetrics->uploadedImageGen = d->maxUploadedImageGen;
+    }
+
+    if (sProfile) {
+        std::fprintf(stderr,
+                     "[PhaseProfile DMABUF] px=%dx%d bucket=%dx%d slot=%d/%zu mod=0x%llx alloc=%.2fms fence=%.2fms sync=%.2fms sub=%.2fms pres=%.2fms total=%.2fms hw=%.2fms\n",
+                     pixelSize.width(), pixelSize.height(),
+                     d->dmabufBucketSize.width(), d->dmabufBucketSize.height(),
+                     chosenRingIdx, d->dmabufRing.size(),
+                     static_cast<unsigned long long>(chosenMod),
+                     double(allocUs) / 1000.0,
+                     double(tAfterFence) / 1000.0,
+                     double(tAfterSync - tAfterSlot) / 1000.0,
+                     double(tBeforePres - tAfterSync) / 1000.0,
+                     double(tAfterPres - tBeforePres) / 1000.0,
+                     double(tAfterPres) / 1000.0,
+                     double(gpuHwUs) / 1000.0);
+    }
+
+    return true;
+#else
+    Q_UNUSED(platformWindow);
+    Q_UNUSED(arena);
+    Q_UNUSED(pixelSize);
+    Q_UNUSED(logicalSize);
+    Q_UNUSED(devicePixelRatio);
+    Q_UNUSED(hasAlpha);
+    Q_UNUSED(frameTimeNs);
+    Q_UNUSED(outMetrics);
+    Q_UNUSED(waitForGpuCompletion);
+    return false;
+#endif
 }
 
 QImage QPhaseVulkanBackend::renderOffscreenToImage(QPhaseSceneArena &arena,

@@ -54,11 +54,24 @@ public:
     bool initializeDevice(bool enableWaylandWsi);
     bool isDeviceReady() const noexcept;
     bool isHardwareGpu() const noexcept;
+    bool supportsDmaBufExport() const noexcept;
     bool usedSharedDeviceCache() const noexcept;
     quint64 sharedDeviceHandle() const noexcept;
     uint32_t sharedDeviceUseCount() const noexcept;
 
-    // Attaches VkSurfaceKHR + VkSwapchainKHR when claiming the Wayland surface
+    // Zero-swapchain bucketed Vulkan DMA-BUF wl_buffer scanout (atomic main-thread Wayland commits!)
+    void releaseDmaBufRing(QPlatformWindow *platformWindow);
+    bool renderAndPresentDmaBuf(QPlatformWindow *platformWindow,
+                                QPhaseSceneArena &arena,
+                                const QSize &pixelSize,
+                                const QSize &logicalSize,
+                                qreal devicePixelRatio,
+                                bool hasAlpha,
+                                uint64_t frameTimeNs,
+                                GpuFrameMetrics *outMetrics = nullptr,
+                                bool waitForGpuCompletion = false);
+
+    // Attaches VkSurfaceKHR + VkSwapchainKHR when claiming the Wayland surface (fallback path)
     bool attachWindow(QPlatformWindow *platformWindow, const QSize &pixelSize, bool hasAlpha);
 
     // Headless VRAM render + VkFence completion + hardware timestamp query (no Wayland calls, no CPU readback)

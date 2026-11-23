@@ -822,6 +822,45 @@ void QPlatformWindow::releasePhasedBootResources()
 {
 }
 
+bool QPlatformWindow::supportsPhasedDmaBuf() const
+{
+    return false;
+}
+
+QList<quint64> QPlatformWindow::phasedDmaBufModifiers(quint32 drmFormat) const
+{
+    Q_UNUSED(drmFormat);
+    return {};
+}
+
+void *QPlatformWindow::createPhasedDmaBufBuffer(const PhasedDmaBufDesc &desc)
+{
+    Q_UNUSED(desc);
+    return nullptr;
+}
+
+void QPlatformWindow::destroyPhasedDmaBufBuffer(void *bufferHandle)
+{
+    Q_UNUSED(bufferHandle);
+}
+
+bool QPlatformWindow::isPhasedDmaBufBufferBusy(void *bufferHandle) const
+{
+    Q_UNUSED(bufferHandle);
+    return false;
+}
+
+void QPlatformWindow::presentPhasedDmaBufBuffer(void *bufferHandle,
+                                                const QSize &pixelSize,
+                                                const QSize &logicalSize,
+                                                const QRegion &bufferPixelDamage)
+{
+    Q_UNUSED(bufferHandle);
+    Q_UNUSED(pixelSize);
+    Q_UNUSED(logicalSize);
+    Q_UNUSED(bufferPixelDamage);
+}
+
 bool QPlatformWindow::createPhasedVulkanSurface(void *vkInstance, void *vkGetInstanceProcAddrFn, void *vkSurfaceOut)
 {
     Q_UNUSED(vkInstance);

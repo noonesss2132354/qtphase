@@ -29,6 +29,7 @@ QT_BEGIN_NAMESPACE
 namespace QtWaylandClient {
 
 class QWaylandShmBuffer;
+class QWaylandDmaBufBuffer;
 
 class Q_WAYLANDCLIENT_EXPORT QWaylandPhasedWindow : public QWaylandWindow
 {
@@ -42,6 +43,15 @@ public:
     bool acquirePhasedBootBuffer(const QSize &pixelSize, qreal dpr, PhasedBootBuffer *outBuffer) override;
     void presentPhasedBootBuffer(void *bufferHandle, const QRegion &damage) override;
     void releasePhasedBootResources() override;
+    bool supportsPhasedDmaBuf() const override;
+    QList<quint64> phasedDmaBufModifiers(quint32 drmFormat) const override;
+    void *createPhasedDmaBufBuffer(const PhasedDmaBufDesc &desc) override;
+    void destroyPhasedDmaBufBuffer(void *bufferHandle) override;
+    bool isPhasedDmaBufBufferBusy(void *bufferHandle) const override;
+    void presentPhasedDmaBufBuffer(void *bufferHandle,
+                                   const QSize &pixelSize,
+                                   const QSize &logicalSize,
+                                   const QRegion &bufferPixelDamage) override;
     bool createPhasedVulkanSurface(void *vkInstance, void *vkGetInstanceProcAddrFn, void *vkSurfaceOut) override;
     bool checkPhasedVulkanPresentSupport(void *vkInstance, void *vkPhysicalDevice,
                                          quint32 queueFamilyIndex, void *vkGetInstanceProcAddrFn) override;
@@ -63,9 +73,12 @@ protected:
 
 private:
     void publishConfiguredSizeLocked(const QSize &logicalSize) noexcept;
+    void releaseDmaBufBuffers();
 
     QList<QWaylandShmBuffer *> m_bootBuffers;
+    QList<QWaylandDmaBufBuffer *> m_dmabufBuffers;
     bool m_bootReleased = false;
+    bool m_usingDmaBuf = false;
     QRecursiveMutex m_waylandCommitMutex;
     std::atomic<bool> m_configureInProgress{false};
     std::atomic<uint64_t> m_configuredLogicalKey{0};

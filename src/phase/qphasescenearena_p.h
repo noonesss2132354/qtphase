@@ -26,6 +26,7 @@
 #include <QtGui/qregion.h>
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -289,6 +290,8 @@ public:
     void resetGpuSteadyState();
     void releaseUploadedCpuImagePixels();
     void acknowledgeGpuImagesUploaded(uint64_t upToGeneration);
+    void advanceFrameEpoch() noexcept { ++m_frameEpoch; }
+    uint64_t frameEpoch() const noexcept { return m_frameEpoch; }
 
     const std::vector<PhaseResolvedTransform> &resolvedTransforms() const noexcept { return m_resolvedTransforms; }
     const std::vector<PhaseResolvedClip> &resolvedClips() const noexcept { return m_resolvedClips; }
@@ -322,11 +325,18 @@ private:
     std::vector<uint32_t> m_freePrimitives;
     std::vector<uint32_t> m_drawOrder;
 
-    // Stage 3 images + bindless free-list
+    // Stage 3 images + FIFO cooldown bindless free-list (prevents in-flight descriptor overwrites!)
+    struct PendingFreeImageSlot {
+        uint32_t slot = 0;
+        uint64_t freedEpoch = 0;
+    };
+    uint32_t acquireFreeOrNewImageSlot(PhaseImageEntry &&entry);
+
     std::vector<PhaseImageEntry> m_images;
-    std::vector<uint32_t> m_freeImageSlots;
+    std::deque<PendingFreeImageSlot> m_freeImageSlots;
     QHash<qint64, uint32_t> m_imageCacheMap;
     uint64_t m_nextImageGen = 1;
+    uint64_t m_frameEpoch = 0;
 
     // Stage 4 hb-gpu curve blobs & color glyph caches
     hb_gpu_draw_t *m_hbGpuDraw = nullptr;
