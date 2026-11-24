@@ -27,6 +27,7 @@ QT_BEGIN_NAMESPACE
 
 class QWindow;
 class QPhaseSceneArena;
+class QPhaseRenderPolicy;
 class QPhaseSurfacePresenterPrivate;
 
 class Q_PHASE_EXPORT QPhaseSurfacePresenter : public QObject
@@ -50,6 +51,10 @@ public:
     const QPhaseSceneArena &arena() const noexcept;
 
     void setSyncCallback(std::function<void(QPhaseSceneArena &)> callback);
+    void setRestoreCpuImagesCallback(std::function<void(QPhaseSceneArena &)> callback);
+    void setRenderPolicy(std::unique_ptr<QPhaseRenderPolicy> policy);
+    const char *renderPolicyName() const noexcept;
+    void reportDirtyAreaRatio(float ratio) noexcept;
     void setForcedAffinity(QPhaseRendererAffinity affinity, bool blocking = false);
 
     // Schedules a UI-Reflex VSync-deadline coalesced sync+present
@@ -74,6 +79,8 @@ private:
     void onProcessWarmupFinished();
     bool ensureVulkanBackendReady();
     void finalizeWinner(Phase winningPhase);
+    void launchAsyncCpuCalibration(const QSize &pxSize, qreal dpr, bool hasAlpha, uint64_t frameTimeNs);
+    void presentFrameInternal(bool isResize);
     bool presentCpuFrame(QPlatformWindow *pw,
                          const QSize &pxSize,
                          qreal dpr,
@@ -87,6 +94,7 @@ private:
                          bool hasAlpha,
                          uint64_t frameTimeNs,
                          bool waitForGpuCompletion,
+                         qint64 *outGpuSubmitUs = nullptr,
                          qint64 *outGpuHwUs = nullptr);
 
     std::unique_ptr<QPhaseSurfacePresenterPrivate> d;

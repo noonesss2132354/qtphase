@@ -49,6 +49,7 @@ qt_internal_add_module(Phase
         qphasescenearena_p.h qphasescenearena.cpp
         qphasevisuals_p.h qphasevisuals.h qphasevisuals.cpp
         qphaseview.h qphaseview.cpp
+        qphaserenderpolicy_p.h qphaserenderpolicy.cpp
         qphasesurfacepresenter_p.h qphasesurfacepresenter.cpp
         qphasewindow.h qphasewindow.cpp
         widgets/qphaselabel.h widgets/qphaselabel.cpp

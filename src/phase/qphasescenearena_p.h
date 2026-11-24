@@ -265,6 +265,10 @@ public:
     const std::vector<PhaseImageEntry> &images() const noexcept { return m_images; }
     size_t activeImageSlotCount() const noexcept;
     size_t activeCpuImageBytes() const noexcept;
+    quint64 pendingGpuUploadBytes() const noexcept;
+
+    // Lightweight snapshot for zero-stall background CPU calibration timing
+    std::unique_ptr<QPhaseSceneArena> cloneForCpuCalibration();
 
     const PhaseRendererRequirements &rendererRequirements() const noexcept { return m_rendererReqs; }
     void setRendererRequirements(const PhaseRendererRequirements &reqs) noexcept { m_rendererReqs = reqs; }

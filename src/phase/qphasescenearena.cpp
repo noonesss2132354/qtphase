@@ -631,6 +631,44 @@ size_t QPhaseSceneArena::activeCpuImageBytes() const noexcept
     return total;
 }
 
+quint64 QPhaseSceneArena::pendingGpuUploadBytes() const noexcept
+{
+    quint64 total = 0;
+    for (const PhaseImageEntry &e : m_images) {
+        if (e.active && !e.isGpuSurface && !e.uploadedToGpu && !e.cpuRgbaPremul.isNull())
+            total += quint64(e.width) * quint64(e.height) * 4ull;
+    }
+    return total;
+}
+
+std::unique_ptr<QPhaseSceneArena> QPhaseSceneArena::cloneForCpuCalibration()
+{
+    resolveHierarchy();
+    auto snap = std::make_unique<QPhaseSceneArena>();
+    snap->m_clearColor = m_clearColor;
+    snap->m_textStemDarkening = m_textStemDarkening;
+    snap->m_resolvedTransforms = m_resolvedTransforms;
+    snap->m_resolvedClips = m_resolvedClips;
+    snap->m_primitives = m_primitives;
+    snap->m_drawOrder = m_drawOrder;
+    snap->m_curves = m_curves;
+    snap->m_curveTexels = m_curveTexels;
+    snap->m_images.resize(m_images.size());
+    for (size_t i = 0; i < m_images.size(); ++i) {
+        const PhaseImageEntry &src = m_images[i];
+        if (!src.active)
+            continue;
+        PhaseImageEntry &dst = snap->m_images[i];
+        dst.width = src.width;
+        dst.height = src.height;
+        dst.cpuRgbaPremul = src.cpuRgbaPremul; // O(1) atomic QImage refcount
+        dst.active = true;
+    }
+    snap->m_transformsDirty = false;
+    snap->m_clipsDirty = false;
+    return snap;
+}
+
 uint32_t QPhaseSceneArena::registerOrGetGlyph(const QRawFont &rawFont, uint32_t glyphId)
 {
     if (!rawFont.isValid() || !m_hbGpuDraw)

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LicenseRef-Qt-Commercial OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "qphasesurfacepresenter_p.h"
+#include "qphaserenderpolicy_p.h"
 #include "qphasescenearena_p.h"
 #include "cpu/qphasecpurasterizer_p.h"
 #include "vulkan/qphasevulkanbackend_p.h"
@@ -26,23 +27,20 @@ QT_BEGIN_NAMESPACE
 
 namespace {
 
-constexpr qint64 kHardwareGpuFastUs = 8000;
-
 enum class ProcessGpuState : uint8_t {
     Uninitialized = 0,
     WarmingUp = 1,
     WarmReady = 2,
-    GpuLocked = 3,
-    CpuLocked = 4
+    Failed = 3
 };
 
-// Once-per-process background Vulkan 1.3 warmup + hardware/timing decision coordinator.
-// Window #1 presents Frame 1 instantly on CPU wl_shm while this single thread warms up VkDevice + pipelines,
-// then probes ONE real presented DMA-BUF frame to lock the process-wide winner (GPU Vulkan 1.3 vs CPU).
-// Every subsequent window, dialog, popup, and re-shown surface attaches directly into steady state (~0.2 ms)!
+// Once-per-process background Vulkan 1.3 warmup coordinator.
+// Shares VkDevice initialization across all windows while letting each window's
+// QPhaseRenderPolicy independently decide CPU vs GPU (and race empirically!).
 struct ProcessGpuCoordinator {
     std::mutex mutex;
     ProcessGpuState state = ProcessGpuState::Uninitialized;
+    bool hardwareGpu = false;
     std::unique_ptr<QPhaseVulkanBackend> warmBackend;
     qint64 warmupUs = 0;
     std::vector<QPointer<QPhaseSurfacePresenter>> waiters;
@@ -67,6 +65,12 @@ struct ProcessGpuCoordinator {
         return state;
     }
 
+    bool isHardwareGpu()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return hardwareGpu;
+    }
+
     qint64 recordedWarmupUs()
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -76,11 +80,8 @@ struct ProcessGpuCoordinator {
     void ensureWarmupStarted(QPhaseSurfacePresenter *waiter, std::function<void(QPointer<QPhaseSurfacePresenter>)> notifyFn)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (state == ProcessGpuState::WarmReady
-            || state == ProcessGpuState::GpuLocked
-            || state == ProcessGpuState::CpuLocked) {
+        if (state == ProcessGpuState::WarmReady || state == ProcessGpuState::Failed)
             return;
-        }
         if (waiter)
             waiters.emplace_back(waiter);
         if (state == ProcessGpuState::WarmingUp)
@@ -92,6 +93,7 @@ struct ProcessGpuCoordinator {
             wt.start();
             auto backend = std::make_unique<QPhaseVulkanBackend>();
             const bool ok = backend->initializeDevice(true);
+            const bool hw = ok && backend->isHardwareGpu();
             const qint64 elapsedUs = wt.nsecsElapsed() / 1000;
 
             std::vector<QPointer<QPhaseSurfacePresenter>> toNotify;
@@ -99,11 +101,12 @@ struct ProcessGpuCoordinator {
                 std::lock_guard<std::mutex> innerLock(mutex);
                 warmupUs = elapsedUs;
                 if (ok) {
+                    hardwareGpu = hw;
                     warmBackend = std::move(backend);
-                    if (state == ProcessGpuState::WarmingUp)
-                        state = ProcessGpuState::WarmReady;
+                    state = ProcessGpuState::WarmReady;
                 } else {
-                    state = ProcessGpuState::CpuLocked;
+                    hardwareGpu = false;
+                    state = ProcessGpuState::Failed;
                 }
                 toNotify.swap(waiters);
             }
@@ -120,15 +123,15 @@ struct ProcessGpuCoordinator {
         std::lock_guard<std::mutex> lock(mutex);
         return std::move(warmBackend);
     }
-
-    void lockWinner(ProcessGpuState lockedState)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        state = lockedState;
-        if (lockedState == ProcessGpuState::CpuLocked)
-            warmBackend.reset();
-    }
 };
+
+inline bool isPopupOrTooltipWindow(const QWindow *win) noexcept
+{
+    if (!win)
+        return false;
+    const Qt::WindowType type = win->type();
+    return type == Qt::Popup || type == Qt::ToolTip || type == Qt::SplashScreen;
+}
 
 } // namespace
 
@@ -138,6 +141,8 @@ public:
     QPointer<QWindow> window;
     QPhaseSceneArena uiArena;
     std::function<void(QPhaseSceneArena &)> syncCallback;
+    std::function<void(QPhaseSceneArena &)> restoreCpuImagesCallback;
+    std::unique_ptr<QPhaseRenderPolicy> policy;
 
     // UI Reflex VSync-deadline coalescer
     QTimer reflexTimer;
@@ -152,24 +157,34 @@ public:
     QPhaseSurfacePresenter::Phase lastFinalizedPhase = QPhaseSurfacePresenter::Phase::WorkerRace;
     QPhaseRendererAffinity forcedAffinity = QPhaseRendererAffinity::Any;
     bool forcedBlocking = false;
+    bool permanentLockActive = false;
+    bool hasPresentedFrame = false;
+    QPhaseBackendTarget lastPresentedBackend = QPhaseBackendTarget::Cpu;
     bool needReleaseBootResources = false;
     bool swapchainFallbackAttached = false;
+    float reportedDirtyAreaRatio = 1.0f;
 
     std::unique_ptr<QPhaseCpuRasterizer> cpuRasterizer;
     QPhaseDamageTracker cpuDamageTracker;
     std::unique_ptr<QPhaseVulkanBackend> vulkanBackend;
+    std::thread cpuCalibThread;
 
     uint64_t nextFrameSeq = 0;
     uint64_t lastDispatchedRev = 0;
     QSize lastDispatchedPxSize;
     qreal lastDispatchedDpr = 0.0;
+    qint64 lastFrameTimeUs = 0;
 
     // Telemetry
     QElapsedTimer createTimer;
     quint64 cpuFrames = 0;
     quint64 gpuFrames = 0;
+    quint64 backendSwitches = 0;
     qint64 lastCpuBootUs = 0;
+    qint64 lastAsyncCpuSampleUs = 0;
     qint64 gpuWarmupUs = 0;
+    qint64 totalCpuWorkUs = 0;
+    qint64 totalGpuSubmitUs = 0;
     qint64 totalGpuHwUs = 0;
     quint64 totalSyncedBytes = 0;
     bool dumpedDebugPng = false;
@@ -186,6 +201,7 @@ QPhaseSurfacePresenter::QPhaseSurfacePresenter(QWindow *window, QObject *parent)
     , d(std::make_unique<QPhaseSurfacePresenterPrivate>())
 {
     d->window = window;
+    d->policy = QPhaseRenderPolicy::createFromEnvironment();
     d->createTimer.start();
 
     d->reflexTimer.setSingleShot(true);
@@ -204,17 +220,6 @@ QPhaseSurfacePresenter::QPhaseSurfacePresenter(QWindow *window, QObject *parent)
                 safeThis->onProcessWarmupFinished();
         }, Qt::QueuedConnection);
     });
-
-    const ProcessGpuState st = coord.currentState();
-    if (st == ProcessGpuState::GpuLocked) {
-        d->phase = Phase::GpuSteadyState;
-        d->lastFinalizedPhase = Phase::GpuSteadyState;
-        d->uiArena.markEnteredGpuSteadyState();
-        d->needReleaseBootResources = true;
-    } else if (st == ProcessGpuState::CpuLocked) {
-        d->phase = Phase::CpuSteadyState;
-        d->lastFinalizedPhase = Phase::CpuSteadyState;
-    }
 }
 
 QPhaseSurfacePresenter::~QPhaseSurfacePresenter()
@@ -222,10 +227,15 @@ QPhaseSurfacePresenter::~QPhaseSurfacePresenter()
     const bool printStats = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_STATS") > 0;
     const quint64 cpuN = d->cpuFrames;
     const quint64 gpuN = d->gpuFrames;
-    const qint64 warmupUs = d->gpuWarmupUs;
+    const quint64 switches = d->backendSwitches;
+    const qint64 warmupUs = d->gpuWarmupUs > 0 ? d->gpuWarmupUs : ProcessGpuCoordinator::instance().recordedWarmupUs();
+    const qint64 cpuUs = d->totalCpuWorkUs;
+    const qint64 gpuSubUs = d->totalGpuSubmitUs;
     const qint64 hwUs = d->totalGpuHwUs;
+    const qint64 asyncCalibUs = d->lastAsyncCpuSampleUs;
     const quint64 bytes = d->totalSyncedBytes;
     const Phase finalPhase = (d->phase != Phase::WorkerRace) ? d->phase : d->lastFinalizedPhase;
+    const QByteArray polName = d->policy ? QByteArray(d->policy->name()) : QByteArrayLiteral("<none>");
     const QString winName = d->window ? d->window->objectName() : QStringLiteral("<null>");
 
     shutdown();
@@ -233,16 +243,23 @@ QPhaseSurfacePresenter::~QPhaseSurfacePresenter()
     if (printStats && (cpuN > 0 || gpuN > 0)) {
         const char *phaseStr = (finalPhase == Phase::GpuSteadyState)
                 ? "GPU Vulkan 1.3"
-                : (finalPhase == Phase::CpuSteadyState ? "CPU Tile Pool" : "WorkerRace");
+                : (finalPhase == Phase::CpuSteadyState ? "CPU Tile Pool" : "Dynamic");
+        const double avgCpuMs = cpuN > 0 ? (double(cpuUs) / double(cpuN)) / 1000.0 : 0.0;
+        const double avgSubMs = gpuN > 0 ? (double(gpuSubUs) / double(gpuN)) / 1000.0 : 0.0;
         const double avgHwMs = gpuN > 0 ? (double(hwUs) / double(gpuN)) / 1000.0 : 0.0;
         const double avgKb = gpuN > 0 ? (double(bytes) / double(gpuN)) / 1024.0 : 0.0;
         std::fprintf(stderr,
-                     "[QtWidgets+QtPhase] %s | winner=%s | warmup=%.2f ms | frames: CPU=%llu GPU=%llu | avg_gpu_hw=%.2f ms | avg_uma=%.1f KB\n",
+                     "[QtWidgets+QtPhase] %s | policy=%s | mode=%s | switches=%llu | warmup=%.2f ms | cpu_calib=%.2f ms | frames: CPU=%llu GPU=%llu | avg_cpu=%.2f ms avg_gpu_sub=%.2f ms avg_gpu_hw=%.2f ms | avg_uma=%.1f KB\n",
                      qPrintable(winName),
+                     polName.constData(),
                      phaseStr,
+                     static_cast<unsigned long long>(switches),
                      double(warmupUs) / 1000.0,
+                     double(asyncCalibUs) / 1000.0,
                      static_cast<unsigned long long>(cpuN),
                      static_cast<unsigned long long>(gpuN),
+                     avgCpuMs,
+                     avgSubMs,
                      avgHwMs,
                      avgKb);
         std::fflush(stderr);
@@ -253,6 +270,8 @@ void QPhaseSurfacePresenter::onSurfaceHidden()
 {
     d->reflexTimer.stop();
     d->presentDirty = false;
+    if (d->cpuCalibThread.joinable())
+        d->cpuCalibThread.join();
     QPlatformWindow *pw = d->window ? d->window->handle() : nullptr;
     if (d->vulkanBackend) {
         d->vulkanBackend->releaseDmaBufRing(pw);
@@ -264,20 +283,12 @@ void QPhaseSurfacePresenter::onSurfaceHidden()
     d->lastDispatchedDpr = 0.0;
     d->uiArena.resetGpuSteadyState();
     d->cpuDamageTracker.reset();
-
-    const ProcessGpuState st = ProcessGpuCoordinator::instance().currentState();
-    if (st == ProcessGpuState::GpuLocked && d->forcedAffinity != QPhaseRendererAffinity::CpuOnly) {
-        d->phase = Phase::GpuSteadyState;
-        d->lastFinalizedPhase = Phase::GpuSteadyState;
-        d->uiArena.markEnteredGpuSteadyState();
-        d->needReleaseBootResources = true;
-    } else if (st == ProcessGpuState::CpuLocked || d->forcedAffinity == QPhaseRendererAffinity::CpuOnly) {
-        d->phase = Phase::CpuSteadyState;
-        d->lastFinalizedPhase = Phase::CpuSteadyState;
-    } else {
-        d->phase = Phase::WorkerRace;
-        d->needReleaseBootResources = false;
-    }
+    d->permanentLockActive = false;
+    d->hasPresentedFrame = false;
+    d->phase = Phase::WorkerRace;
+    d->needReleaseBootResources = false;
+    if (d->policy)
+        d->policy->reset();
 }
 
 void QPhaseSurfacePresenter::shutdown()
@@ -286,6 +297,8 @@ void QPhaseSurfacePresenter::shutdown()
         return;
     d->isShutDown = true;
     d->reflexTimer.stop();
+    if (d->cpuCalibThread.joinable())
+        d->cpuCalibThread.join();
     QPlatformWindow *pw = d->window ? d->window->handle() : nullptr;
     if (d->vulkanBackend) {
         d->vulkanBackend->releaseDmaBufRing(pw);
@@ -307,6 +320,30 @@ const QPhaseSceneArena &QPhaseSurfacePresenter::arena() const noexcept
 void QPhaseSurfacePresenter::setSyncCallback(std::function<void(QPhaseSceneArena &)> callback)
 {
     d->syncCallback = std::move(callback);
+}
+
+void QPhaseSurfacePresenter::setRestoreCpuImagesCallback(std::function<void(QPhaseSceneArena &)> callback)
+{
+    d->restoreCpuImagesCallback = std::move(callback);
+}
+
+void QPhaseSurfacePresenter::setRenderPolicy(std::unique_ptr<QPhaseRenderPolicy> policy)
+{
+    if (!policy)
+        return;
+    d->policy = std::move(policy);
+    d->permanentLockActive = false;
+    d->phase = Phase::WorkerRace;
+}
+
+const char *QPhaseSurfacePresenter::renderPolicyName() const noexcept
+{
+    return d->policy ? d->policy->name() : "";
+}
+
+void QPhaseSurfacePresenter::reportDirtyAreaRatio(float ratio) noexcept
+{
+    d->reportedDirtyAreaRatio = std::clamp(ratio, 0.0f, 1.0f);
 }
 
 void QPhaseSurfacePresenter::setForcedAffinity(QPhaseRendererAffinity affinity, bool blocking)
@@ -335,19 +372,8 @@ void QPhaseSurfacePresenter::onProcessWarmupFinished()
     if (d->isShutDown)
         return;
 
-    const ProcessGpuState st = ProcessGpuCoordinator::instance().currentState();
-    if (st == ProcessGpuState::CpuLocked) {
-        finalizeWinner(Phase::CpuSteadyState);
-        if (d->presentDirty && d->window && d->window->isExposed())
-            presentNow();
-        return;
-    }
-
-    if (st == ProcessGpuState::GpuLocked && d->forcedAffinity != QPhaseRendererAffinity::CpuOnly)
-        finalizeWinner(Phase::GpuSteadyState);
-
     if (d->window && d->window->isExposed()
-        && (d->presentDirty || d->phase == Phase::WorkerRace || d->gpuFrames == 0)) {
+        && (d->presentDirty || (!d->permanentLockActive && d->gpuFrames == 0))) {
         presentNow();
     }
 }
@@ -378,6 +404,7 @@ bool QPhaseSurfacePresenter::ensureVulkanBackendReady()
 
 void QPhaseSurfacePresenter::finalizeWinner(Phase winningPhase)
 {
+    d->permanentLockActive = true;
     if (winningPhase == Phase::GpuSteadyState) {
         d->phase = Phase::GpuSteadyState;
         d->lastFinalizedPhase = Phase::GpuSteadyState;
@@ -401,6 +428,44 @@ void QPhaseSurfacePresenter::finalizeWinner(Phase winningPhase)
         }
         d->swapchainFallbackAttached = false;
     }
+}
+
+void QPhaseSurfacePresenter::launchAsyncCpuCalibration(const QSize &pxSize,
+                                                       qreal dpr,
+                                                       bool hasAlpha,
+                                                       uint64_t frameTimeNs)
+{
+    if (d->cpuCalibThread.joinable() || pxSize.isEmpty())
+        return;
+
+    // Clone POD vectors + O(1) QImage refcounts BEFORE GPU upload clears cpuRgbaPremul!
+    auto snapshot = d->uiArena.cloneForCpuCalibration();
+    QPointer<QPhaseSurfacePresenter> safeThis(this);
+    const int w = pxSize.width();
+    const int h = pxSize.height();
+
+    d->cpuCalibThread = std::thread([safeThis, snap = std::move(snapshot), w, h, dpr, hasAlpha, frameTimeNs]() mutable {
+        std::vector<uchar> scratch(size_t(w) * size_t(h) * 4);
+        QPhaseCpuRasterizer calibRaster;
+        QElapsedTimer t;
+        t.start();
+        calibRaster.renderToBuffer(*snap, scratch.data(), w, h, w * 4, dpr, !hasAlpha, frameTimeNs);
+        const qint64 elapsedUs = t.nsecsElapsed() / 1000;
+
+        if (!safeThis)
+            return;
+        QMetaObject::invokeMethod(safeThis.data(), [safeThis, elapsedUs]() {
+            if (!safeThis || safeThis->d->isShutDown)
+                return;
+            safeThis->d->lastAsyncCpuSampleUs = elapsedUs;
+            if (safeThis->d->policy)
+                safeThis->d->policy->recordAsyncCpuSample(elapsedUs);
+            if (qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0) {
+                std::fprintf(stderr, "[PhaseProfile Policy=%s] async_cpu_calib=%.2fms\n",
+                             safeThis->renderPolicyName(), double(elapsedUs) / 1000.0);
+            }
+        }, Qt::QueuedConnection);
+    });
 }
 
 bool QPhaseSurfacePresenter::presentCpuFrame(QPlatformWindow *pw,
@@ -464,6 +529,7 @@ bool QPhaseSurfacePresenter::presentCpuFrame(QPlatformWindow *pw,
 
     pw->presentPhasedBootBuffer(bootBuf.handle, logicalDmg);
     ++d->cpuFrames;
+    d->totalCpuWorkUs += cpuWorkUs;
     d->lastCpuBootUs = cpuWorkUs;
     d->lastVsyncAnchorUs = d->createTimer.nsecsElapsed() / 1000;
     d->rollingBackendRenderUs = (d->rollingBackendRenderUs * 3 + cpuWorkUs) / 4;
@@ -477,6 +543,7 @@ bool QPhaseSurfacePresenter::presentGpuFrame(QPlatformWindow *pw,
                                              bool hasAlpha,
                                              uint64_t frameTimeNs,
                                              bool waitForGpuCompletion,
+                                             qint64 *outGpuSubmitUs,
                                              qint64 *outGpuHwUs)
 {
     if (!pw || pxSize.isEmpty() || logicalSize.isEmpty() || !ensureVulkanBackendReady())
@@ -520,8 +587,11 @@ bool QPhaseSurfacePresenter::presentGpuFrame(QPlatformWindow *pw,
         return false;
 
     ++d->gpuFrames;
+    d->totalGpuSubmitUs += metrics.cpuSubmitWorkUs;
     d->totalGpuHwUs += metrics.gpuHardwareUs;
     d->totalSyncedBytes += metrics.syncedSceneBytes;
+    if (outGpuSubmitUs)
+        *outGpuSubmitUs = metrics.cpuSubmitWorkUs;
     if (outGpuHwUs)
         *outGpuHwUs = metrics.gpuHardwareUs;
 
@@ -545,7 +615,7 @@ void QPhaseSurfacePresenter::schedulePresent()
     if (d->reflexTimer.isActive())
         return;
 
-    if (d->phase == Phase::WorkerRace) {
+    if (!d->hasPresentedFrame) {
         // Coalesce to 0 ms event-loop turn (never paint synchronously mid-layout inside QWidget::update()!)
         d->reflexTimer.start(0);
         return;
@@ -589,10 +659,15 @@ void QPhaseSurfacePresenter::presentResizeNow()
         d->presentDirty = true;
         return;
     }
-    presentNow();
+    presentFrameInternal(true);
 }
 
 void QPhaseSurfacePresenter::presentNow()
+{
+    presentFrameInternal(false);
+}
+
+void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
 {
     if (d->isShutDown || !d->window || !d->window->isExposed())
         return;
@@ -610,14 +685,13 @@ void QPhaseSurfacePresenter::presentNow()
     const QSize logicalSize = d->window->size();
     const QSize platformLogicalSize = pw->geometry().size();
     if (!platformLogicalSize.isEmpty() && platformLogicalSize != logicalSize) {
-        // QWaylandWindow::applyConfigure() already set destination to platformLogicalSize while
-        // the queued QWindowSystemInterface::handleGeometryChange() hasn't updated QWindow::size() yet.
         d->presentDirty = true;
         return;
     }
 
     d->reflexTimer.stop();
     d->presentDirty = false;
+    d->reportedDirtyAreaRatio = 1.0f;
 
     static const bool sProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0;
     QElapsedTimer syncTimer;
@@ -633,108 +707,164 @@ void QPhaseSurfacePresenter::presentNow()
     const QSize pxSize = (finalLogicalSize * dpr).expandedTo(QSize(1, 1));
     const bool hasAlpha = d->window->requestedFormat().hasAlpha();
     const uint64_t frameTimeNs = d->uiArena.monotonicTimestampNs();
+    const bool sizeChanged = (pxSize != d->lastDispatchedPxSize || !qFuzzyCompare(dpr, d->lastDispatchedDpr));
 
-    // Honor forced renderer affinity if explicitly set
     auto &coord = ProcessGpuCoordinator::instance();
-    if (d->phase == Phase::WorkerRace) {
-        if (d->forcedAffinity == QPhaseRendererAffinity::CpuOnly) {
-            finalizeWinner(Phase::CpuSteadyState);
-        } else if (d->forcedAffinity == QPhaseRendererAffinity::GpuOnly
-                   && coord.currentState() != ProcessGpuState::CpuLocked) {
-            if (d->forcedBlocking || coord.currentState() == ProcessGpuState::WarmReady
-                || coord.currentState() == ProcessGpuState::GpuLocked) {
-                finalizeWinner(Phase::GpuSteadyState);
-            }
+    const ProcessGpuState coordState = coord.currentState();
+    const PhaseRendererRequirements &reqs = d->uiArena.rendererRequirements();
+
+    QPhaseSurfaceCaps caps{};
+    caps.isPopupOrTooltip = isPopupOrTooltipWindow(d->window);
+    caps.vulkanWarmReady = (coordState == ProcessGpuState::WarmReady);
+    caps.vulkanFailed = (coordState == ProcessGpuState::Failed);
+    caps.isHardwareGpu = coord.isHardwareGpu();
+    caps.forcedAffinity = d->forcedAffinity;
+    caps.forcedBlocking = d->forcedBlocking;
+    caps.hasCpuOnlyViews = (reqs.cpuOnlyViewCount > 0);
+    caps.hasGpuOnlyViews = (reqs.gpuOnlyViewCount > 0);
+
+    const qint64 nowUs = d->createTimer.nsecsElapsed() / 1000;
+    const quint64 pendingUploads = d->uiArena.pendingGpuUploadBytes();
+
+    QPhaseFrameRequest freq{};
+    freq.pixelSize = pxSize;
+    freq.logicalSize = finalLogicalSize;
+    freq.devicePixelRatio = dpr;
+    freq.isResize = isResize;
+    freq.sizeChanged = sizeChanged;
+    freq.hasActiveAnimations = d->uiArena.hasActiveAnimations();
+    freq.primitiveCount = uint32_t(d->uiArena.drawOrder().size());
+    freq.activeImageCount = uint32_t(d->uiArena.activeImageSlotCount());
+    freq.pendingUploadBytes = pendingUploads;
+    freq.dirtyAreaRatio = (isResize || sizeChanged || !d->hasPresentedFrame) ? 1.0f : d->reportedDirtyAreaRatio;
+    freq.frameIndex = d->cpuFrames + d->gpuFrames;
+    freq.msSinceLastFrame = d->lastFrameTimeUs > 0 ? std::max<qint64>(0, (nowUs - d->lastFrameTimeUs) / 1000) : 0;
+    d->lastFrameTimeUs = nowUs;
+
+    if (!d->policy)
+        d->policy = QPhaseRenderPolicy::createFromEnvironment();
+
+    const QPhasePolicyDecision decision = d->policy->decide(caps, freq);
+    const bool switchingBackend = d->hasPresentedFrame && (decision.target != d->lastPresentedBackend);
+
+    if (switchingBackend) {
+        ++d->backendSwitches;
+        if (sProfile) {
+            std::fprintf(stderr, "[PhaseProfile Policy=%s] switch %s -> %s (%s, dirty=%.0f%%)\n",
+                         d->policy->name(),
+                         d->lastPresentedBackend == QPhaseBackendTarget::Gpu ? "GPU" : "CPU",
+                         decision.target == QPhaseBackendTarget::Gpu ? "GPU" : "CPU",
+                         decision.reason ? decision.reason : "",
+                         double(freq.dirtyAreaRatio) * 100.0);
         }
     }
 
-    // Check if another window already locked the process-wide winner
-    if (d->phase == Phase::WorkerRace) {
-        const ProcessGpuState st = coord.currentState();
-        if (st == ProcessGpuState::GpuLocked)
-            finalizeWinner(Phase::GpuSteadyState);
-        else if (st == ProcessGpuState::CpuLocked)
-            finalizeWinner(Phase::CpuSteadyState);
-    }
-
-    if (d->phase == Phase::GpuSteadyState) {
+    if (decision.target == QPhaseBackendTarget::Gpu) {
         if (d->needReleaseBootResources) {
             d->needReleaseBootResources = false;
             pw->releasePhasedBootResources();
         }
-        if (d->uiArena.revision() == d->lastDispatchedRev
-            && pxSize == d->lastDispatchedPxSize
-            && qFuzzyCompare(dpr, d->lastDispatchedDpr)
-            && !d->uiArena.hasActiveAnimations()) {
+
+        if (!switchingBackend
+            && d->hasPresentedFrame
+            && d->lastPresentedBackend == QPhaseBackendTarget::Gpu
+            && d->uiArena.revision() == d->lastDispatchedRev
+            && !sizeChanged
+            && !freq.hasActiveAnimations) {
             return;
         }
 
+        // Snapshot scene for zero-stall background CPU calibration BEFORE GPU upload frees cpuRgbaPremul!
+        if (decision.requestAsyncCpuSample)
+            launchAsyncCpuCalibration(pxSize, dpr, hasAlpha, frameTimeNs);
+
         const uint64_t seq = ++d->nextFrameSeq;
         if (sProfile) {
-            std::fprintf(stderr, "[PhaseProfile UI] seq=%llu px=%dx%d sync=%.2fms prims=%zu imgs=%zu\n",
+            std::fprintf(stderr, "[PhaseProfile UI] seq=%llu px=%dx%d sync=%.2fms prims=%zu imgs=%zu [%s:%s]\n",
                          static_cast<unsigned long long>(seq),
                          pxSize.width(), pxSize.height(), double(syncUs) / 1000.0,
-                         d->uiArena.drawOrder().size(), d->uiArena.activeImageSlotCount());
+                         d->uiArena.drawOrder().size(), d->uiArena.activeImageSlotCount(),
+                         d->policy->name(), decision.reason ? decision.reason : "");
         }
 
-        if (presentGpuFrame(pw, pxSize, finalLogicalSize, dpr, hasAlpha, frameTimeNs, false)) {
+        qint64 gpuSubmitUs = 0;
+        qint64 gpuHwUs = 0;
+        const bool okGpu = presentGpuFrame(pw, pxSize, finalLogicalSize, dpr, hasAlpha, frameTimeNs,
+                                           decision.waitForGpuCompletion, &gpuSubmitUs, &gpuHwUs);
+
+        QPhaseFrameOutcome outcome{};
+        outcome.backend = QPhaseBackendTarget::Gpu;
+        outcome.succeeded = okGpu;
+        outcome.wasResize = isResize;
+        outcome.cpuWorkUs = gpuSubmitUs;
+        outcome.gpuHwUs = gpuHwUs;
+        outcome.uploadedBytes = pendingUploads;
+        outcome.dirtyAreaRatio = freq.dirtyAreaRatio;
+        d->policy->recordOutcome(outcome);
+
+        if (okGpu) {
+            d->hasPresentedFrame = true;
+            d->lastPresentedBackend = QPhaseBackendTarget::Gpu;
             d->lastDispatchedRev = d->uiArena.revision();
             d->lastDispatchedPxSize = pxSize;
             d->lastDispatchedDpr = dpr;
+            if (decision.lockPermanent && !d->permanentLockActive)
+                finalizeWinner(Phase::GpuSteadyState);
         } else {
-            // Transient failure: allow retry on next schedule
-            d->lastDispatchedRev = 0;
-            d->presentDirty = true;
-        }
-        return;
-    }
-
-    if (d->phase == Phase::CpuSteadyState) {
-        presentCpuFrame(pw, pxSize, dpr, hasAlpha, frameTimeNs);
-        return;
-    }
-
-    // Phase::WorkerRace — Cold-start temporal handoff (once per process!):
-    // 1. While the single background thread is still warming up Vulkan 1.3, render Frame 1+ instantly on CPU wl_shm.
-    // 2. Once Vulkan 1.3 is warm (WarmReady):
-    //    - On real hardware GPUs: present Frame 1 asynchronously (waitForGpuCompletion=false, 0 ms fence stall!)
-    //      and lock GpuSteadyState immediately so cold startup matches upstream Qt Widgets!
-    //    - On software Vulkan (e.g. llvmpipe): probe ONE real frame with waitForGpuCompletion=true and
-    //      lock whichever backend is genuinely faster.
-    if (coord.currentState() == ProcessGpuState::WarmReady) {
-        const bool backendOk = ensureVulkanBackendReady();
-        const bool hwGpu = backendOk && d->vulkanBackend && d->vulkanBackend->isHardwareGpu();
-        qint64 probeHwUs = 0;
-        const bool okGpu = backendOk && presentGpuFrame(
-                pw, pxSize, finalLogicalSize, dpr, hasAlpha, frameTimeNs, !hwGpu, &probeHwUs);
-        const qint64 cpuRefUs = (d->lastCpuBootUs > 0) ? d->lastCpuBootUs : 4000;
-        const bool gpuWins = okGpu && (hwGpu || (probeHwUs > 0 && probeHwUs < cpuRefUs));
-
-        if (gpuWins) {
-            coord.lockWinner(ProcessGpuState::GpuLocked);
-            d->lastDispatchedRev = d->uiArena.revision();
-            d->lastDispatchedPxSize = pxSize;
-            d->lastDispatchedDpr = dpr;
-            finalizeWinner(Phase::GpuSteadyState);
-            if (sProfile) {
-                std::fprintf(stderr, "[PhaseProfile UI] seq=%llu px=%dx%d sync=%.2fms prims=%zu imgs=%zu (%s->GPU hw=%.2fms vs cpu=%.2fms)\n",
-                             static_cast<unsigned long long>(++d->nextFrameSeq),
-                             pxSize.width(), pxSize.height(), double(syncUs) / 1000.0,
-                             d->uiArena.drawOrder().size(), d->uiArena.activeImageSlotCount(),
-                             hwGpu ? "hw-async" : "probe",
-                             double(probeHwUs) / 1000.0, double(cpuRefUs) / 1000.0);
+            // Immediate safe fallback to CPU so we never drop a frame
+            qint64 fallbackCpuUs = 0;
+            if (presentCpuFrame(pw, pxSize, dpr, hasAlpha, frameTimeNs, &fallbackCpuUs)) {
+                d->hasPresentedFrame = true;
+                d->lastPresentedBackend = QPhaseBackendTarget::Cpu;
+                d->lastDispatchedPxSize = pxSize;
+                d->lastDispatchedDpr = dpr;
+            } else {
+                d->lastDispatchedRev = 0;
+                d->presentDirty = true;
             }
-        } else {
-            coord.lockWinner(ProcessGpuState::CpuLocked);
-            finalizeWinner(Phase::CpuSteadyState);
-            if (!okGpu)
-                presentCpuFrame(pw, pxSize, dpr, hasAlpha, frameTimeNs);
         }
         return;
     }
 
-    // Still WarmingUp: instant CPU wl_shm first-frame boot!
-    presentCpuFrame(pw, pxSize, dpr, hasAlpha, frameTimeNs);
+    // Target == Cpu
+    if (switchingBackend && d->lastPresentedBackend == QPhaseBackendTarget::Gpu) {
+        d->uiArena.resetGpuSteadyState();
+        d->cpuDamageTracker.reset();
+        // Re-populate CPU QImage references (zero-copy!) if GPU steady-state already cleared them
+        if (d->restoreCpuImagesCallback && d->syncCallback
+            && d->uiArena.activeImageSlotCount() > 0 && d->uiArena.activeCpuImageBytes() == 0) {
+            d->restoreCpuImagesCallback(d->uiArena);
+            d->syncCallback(d->uiArena);
+        }
+    }
+
+    qint64 cpuWorkUs = 0;
+    const bool okCpu = presentCpuFrame(pw, pxSize, dpr, hasAlpha, frameTimeNs, &cpuWorkUs);
+
+    QPhaseFrameOutcome outcome{};
+    outcome.backend = QPhaseBackendTarget::Cpu;
+    outcome.succeeded = okCpu;
+    outcome.wasResize = isResize;
+    outcome.cpuWorkUs = cpuWorkUs;
+    outcome.dirtyAreaRatio = freq.dirtyAreaRatio;
+    d->policy->recordOutcome(outcome);
+
+    if (okCpu) {
+        d->hasPresentedFrame = true;
+        d->lastPresentedBackend = QPhaseBackendTarget::Cpu;
+        d->lastDispatchedRev = d->uiArena.revision();
+        d->lastDispatchedPxSize = pxSize;
+        d->lastDispatchedDpr = dpr;
+        if (sProfile) {
+            std::fprintf(stderr, "[PhaseProfile CPU] seq=%llu px=%dx%d sync=%.2fms raster=%.2fms [%s:%s]\n",
+                         static_cast<unsigned long long>(++d->nextFrameSeq),
+                         pxSize.width(), pxSize.height(), double(syncUs) / 1000.0,
+                         double(cpuWorkUs) / 1000.0,
+                         d->policy->name(), decision.reason ? decision.reason : "");
+        }
+        if (decision.lockPermanent && !d->permanentLockActive)
+            finalizeWinner(Phase::CpuSteadyState);
+    }
 }
 
 QT_END_NAMESPACE

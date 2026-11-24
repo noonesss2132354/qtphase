@@ -85,7 +85,8 @@ private:
                              uint32_t parentTransformSlot,
                              uint32_t parentClipSlot,
                              std::vector<uint32_t> &outDrawOrder,
-                             bool &drawOrderChanged);
+                             bool &drawOrderChanged,
+                             qint64 &outDirtyArea);
     void paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, QPhaseSceneArena &arena);
 
     QWidget *m_tlw = nullptr;

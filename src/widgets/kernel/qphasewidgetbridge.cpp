@@ -91,6 +91,10 @@ QPhaseWidgetBridge::QPhaseWidgetBridge(QWidget *topLevelWidget, QWindow *widgetW
     m_presenter->setSyncCallback([this](QPhaseSceneArena &arena) {
         syncSceneTree(arena);
     });
+    m_presenter->setRestoreCpuImagesCallback([this](QPhaseSceneArena &arena) {
+        m_imageCache.clear(arena);
+        m_allDirty = true;
+    });
 }
 
 QPhaseWidgetBridge::~QPhaseWidgetBridge()
@@ -236,9 +240,14 @@ void QPhaseWidgetBridge::syncSceneTree(QPhaseSceneArena &arena)
     std::vector<uint32_t> drawOrder;
     drawOrder.reserve(m_lastDrawOrder.size() + 32);
     bool drawOrderChanged = false;
+    qint64 dirtyArea = 0;
 
-    syncWidgetRecursive(m_tlw, arena, 0u, 0u, drawOrder, drawOrderChanged);
+    syncWidgetRecursive(m_tlw, arena, 0u, 0u, drawOrder, drawOrderChanged, dirtyArea);
     m_allDirty = false;
+
+    const qint64 tlwArea = std::max<qint64>(1, qint64(m_tlw->width()) * qint64(m_tlw->height()));
+    if (m_presenter)
+        m_presenter->reportDirtyAreaRatio(float(std::min<double>(1.0, double(dirtyArea) / double(tlwArea))));
 
     if (drawOrderChanged || drawOrder != m_lastDrawOrder) {
         m_lastDrawOrder = drawOrder;
@@ -253,7 +262,8 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
                                              uint32_t parentTransformSlot,
                                              uint32_t parentClipSlot,
                                              std::vector<uint32_t> &outDrawOrder,
-                                             bool &drawOrderChanged)
+                                             bool &drawOrderChanged,
+                                             qint64 &outDirtyArea)
 {
     if (!w || w->isHidden())
         return;
@@ -303,6 +313,8 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
             node.visualsDirty = true;
             node.fullRepaintNeeded = true;
             node.dirtyRegion = QRegion();
+        } else {
+            outDirtyArea += qint64(std::max(0, geom.width())) * qint64(std::max(0, geom.height()));
         }
     }
 
@@ -310,6 +322,12 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
         if (m_allDirty) {
             node.fullRepaintNeeded = true;
             node.dirtyRegion = QRegion();
+        }
+        if (node.fullRepaintNeeded || node.dirtyRegion.isEmpty()) {
+            outDirtyArea += qint64(std::max(0, w->width())) * qint64(std::max(0, w->height()));
+        } else {
+            const QRect dbr = node.dirtyRegion.boundingRect() & w->rect();
+            outDirtyArea += qint64(std::max(0, dbr.width())) * qint64(std::max(0, dbr.height()));
         }
         paintSingleWidget(w, node, arena);
         node.visualsDirty = false;
@@ -326,7 +344,7 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
         if (auto *ch = qobject_cast<QWidget *>(obj)) {
             if (!ch->isWindow() && !ch->isHidden()) {
                 syncWidgetRecursive(ch, arena, node.transformSlot, node.clipSlot,
-                                    outDrawOrder, drawOrderChanged);
+                                    outDrawOrder, drawOrderChanged, outDirtyArea);
             }
         }
     }
