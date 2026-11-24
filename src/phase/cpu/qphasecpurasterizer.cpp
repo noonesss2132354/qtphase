@@ -122,10 +122,20 @@ inline void sampleBilinearPremulRgba8888(const QImage &img, float u, float v,
     const float w01 = (1.0f - fx) * fy * (1.0f / 255.0f);
     const float w11 = fx * fy * (1.0f / 255.0f);
 
-    outR = float(p00[0]) * w00 + float(p10[0]) * w10 + float(p01[0]) * w01 + float(p11[0]) * w11;
-    outG = float(p00[1]) * w00 + float(p10[1]) * w10 + float(p01[1]) * w01 + float(p11[1]) * w11;
-    outB = float(p00[2]) * w00 + float(p10[2]) * w10 + float(p01[2]) * w01 + float(p11[2]) * w11;
-    outA = float(p00[3]) * w00 + float(p10[3]) * w10 + float(p01[3]) * w01 + float(p11[3]) * w11;
+    const QImage::Format fmt = img.format();
+    if (fmt == QImage::Format_ARGB32_Premultiplied || fmt == QImage::Format_RGB32) {
+        outB = float(p00[0]) * w00 + float(p10[0]) * w10 + float(p01[0]) * w01 + float(p11[0]) * w11;
+        outG = float(p00[1]) * w00 + float(p10[1]) * w10 + float(p01[1]) * w01 + float(p11[1]) * w11;
+        outR = float(p00[2]) * w00 + float(p10[2]) * w10 + float(p01[2]) * w01 + float(p11[2]) * w11;
+        outA = (fmt == QImage::Format_RGB32)
+                ? 1.0f
+                : (float(p00[3]) * w00 + float(p10[3]) * w10 + float(p01[3]) * w01 + float(p11[3]) * w11);
+    } else {
+        outR = float(p00[0]) * w00 + float(p10[0]) * w10 + float(p01[0]) * w01 + float(p11[0]) * w11;
+        outG = float(p00[1]) * w00 + float(p10[1]) * w10 + float(p01[1]) * w01 + float(p11[1]) * w11;
+        outB = float(p00[2]) * w00 + float(p10[2]) * w10 + float(p01[2]) * w01 + float(p11[2]) * w11;
+        outA = float(p00[3]) * w00 + float(p10[3]) * w10 + float(p01[3]) * w01 + float(p11[3]) * w11;
+    }
 }
 
 inline float evalCpuClipChainCoverage(float fragX, float fragY,

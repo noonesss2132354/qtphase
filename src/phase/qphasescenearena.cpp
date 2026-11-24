@@ -557,7 +557,20 @@ uint32_t QPhaseSceneArena::registerOrGetImage(const QImage &image)
     entry.sourceCacheKey = key;
     entry.width = image.width();
     entry.height = image.height();
+#if Q_BYTE_ORDER == Q_LITTLE_ENDIAN
+    const QImage::Format fmt = image.format();
+    if (fmt == QImage::Format_RGBA8888_Premultiplied
+        || fmt == QImage::Format_ARGB32_Premultiplied
+        || fmt == QImage::Format_RGB32) {
+        // Zero-copy retain! Vulkan natively samples BGRA8 (with A=1 swizzle for RGB32)
+        // without allocating a multi-megabyte CPU copy or swizzling pixels on the UI thread.
+        entry.cpuRgbaPremul = image;
+    } else {
+        entry.cpuRgbaPremul = image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    }
+#else
     entry.cpuRgbaPremul = image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+#endif
     entry.generation = ++m_nextImageGen;
     entry.uploadedToGpu = false;
     entry.active = true;
@@ -1272,7 +1285,11 @@ void QPhaseSceneArena::rasterizeDirtyCpuBridges(QPhaseCpuRasterizer &cpuRasteriz
         PhaseImageEntry &ie = m_images[br.imageSlot];
         ie.width = pxW;
         ie.height = pxH;
+#if Q_BYTE_ORDER == Q_LITTLE_ENDIAN
+        ie.cpuRgbaPremul = std::move(bgra);
+#else
         ie.cpuRgbaPremul = bgra.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+#endif
         ie.generation = ++m_nextImageGen;
         ie.uploadedToGpu = false;
         ie.active = true;

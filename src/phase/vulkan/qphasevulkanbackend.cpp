@@ -1641,8 +1641,14 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
                 + VkDeviceSize(entry.width) * VkDeviceSize(entry.height) * 4;
     }
 
+    static const bool sImgProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 1;
+    QElapsedTimer imgProfTimer;
+    if (sImgProfile)
+        imgProfTimer.start();
+
     if (overwritingActiveSlotWhileInFlight)
         waitAllBackendFramesIdle(d);
+    const qint64 waitIdleUs = sImgProfile ? (imgProfTimer.nsecsElapsed() / 1000) : 0;
 
     std::vector<VkDescriptorImageInfo> descInfos;
     std::vector<VkWriteDescriptorSet> descWrites;
@@ -1739,13 +1745,30 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
         }
     }
 
+    // Release oversized transient staging buffers (> 4 MB) once this frame slot is idle and no longer needs them
+    constexpr VkDeviceSize kSteadyStagingLimit = 4 * 1024 * 1024;
+    if (totalUploadBytes == 0 && f.stagingBuffer != VK_NULL_HANDLE && f.stagingCapacity > kSteadyStagingLimit) {
+        vmaDestroyBuffer(alloc, f.stagingBuffer, f.stagingAlloc);
+        f.stagingBuffer = VK_NULL_HANDLE;
+        f.stagingAlloc = VK_NULL_HANDLE;
+        f.stagingAllocInfo = {};
+        f.stagingCapacity = 0;
+    }
+
+    qint64 stgAllocUs = 0;
+    qint64 memcpyUs = 0;
+    qint64 vkImgUs = 0;
+    uint32_t uploadedCount = 0;
+
     if (totalUploadBytes > 0) {
+        const qint64 t0 = sImgProfile ? (imgProfTimer.nsecsElapsed() / 1000) : 0;
         if (totalUploadBytes > f.stagingCapacity) {
             if (f.stagingBuffer != VK_NULL_HANDLE) {
                 vmaDestroyBuffer(alloc, f.stagingBuffer, f.stagingAlloc);
                 f.stagingBuffer = VK_NULL_HANDLE;
             }
-            const VkDeviceSize newCap = std::max<VkDeviceSize>(totalUploadBytes * 2, 256 * 1024);
+            const VkDeviceSize newCap = std::max<VkDeviceSize>(
+                    alignUp(totalUploadBytes, 512 * 1024), 256 * 1024);
 
             VkBufferCreateInfo stgInfo{};
             stgInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1753,13 +1776,17 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
             stgInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
             VmaAllocationCreateInfo stgVma{};
-            stgVma.usage = VMA_MEMORY_USAGE_AUTO;
+            // Keep staging buffers in host system RAM (GTT) so multi-megabyte document page
+            // uploads never thrash integrated GPU BAR VRAM or trigger slow eviction.
+            stgVma.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
             stgVma.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
             if (vmaCreateBuffer(alloc, &stgInfo, &stgVma, &f.stagingBuffer, &f.stagingAlloc, &f.stagingAllocInfo) != VK_SUCCESS)
                 return false;
             f.stagingCapacity = newCap;
         }
+        if (sImgProfile)
+            stgAllocUs = (imgProfTimer.nsecsElapsed() / 1000) - t0;
 
         auto *stgBase = static_cast<uchar *>(f.stagingAllocInfo.pMappedData);
         VkDeviceSize writeCursor = 0;
@@ -1774,14 +1801,29 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
             const VkDeviceSize imgBytes = VkDeviceSize(w) * VkDeviceSize(h) * 4;
             writeCursor = alignUp(writeCursor, 16);
 
+            const qint64 tm0 = sImgProfile ? (imgProfTimer.nsecsElapsed() / 1000) : 0;
             uchar *dst = stgBase + writeCursor;
-            for (uint32_t row = 0; row < h; ++row)
-                std::memcpy(dst + size_t(row) * w * 4, entry.cpuRgbaPremul.constScanLine(int(row)), size_t(w) * 4);
+            const qsizetype srcStride = entry.cpuRgbaPremul.bytesPerLine();
+            const size_t rowBytes = size_t(w) * 4;
+            if (size_t(srcStride) == rowBytes) {
+                std::memcpy(dst, entry.cpuRgbaPremul.constBits(), size_t(imgBytes));
+            } else {
+                const uchar *src = entry.cpuRgbaPremul.constBits();
+                for (uint32_t row = 0; row < h; ++row)
+                    std::memcpy(dst + size_t(row) * rowBytes, src + size_t(row) * size_t(srcStride), rowBytes);
+            }
+            if (sImgProfile)
+                memcpyUs += (imgProfTimer.nsecsElapsed() / 1000) - tm0;
+
+            const qint64 ti0 = sImgProfile ? (imgProfTimer.nsecsElapsed() / 1000) : 0;
+            const QImage::Format srcFmt = entry.cpuRgbaPremul.format();
+            const bool isBgra = (srcFmt == QImage::Format_ARGB32_Premultiplied || srcFmt == QImage::Format_RGB32);
+            const VkFormat vkFmt = isBgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
 
             VkImageCreateInfo imgInfo{};
             imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             imgInfo.imageType = VK_IMAGE_TYPE_2D;
-            imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            imgInfo.format = vkFmt;
             imgInfo.extent = { w, h, 1 };
             imgInfo.mipLevels = 1;
             imgInfo.arrayLayers = 1;
@@ -1803,12 +1845,24 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
             ivInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             ivInfo.image = gpuTex.image;
             ivInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            ivInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ivInfo.format = vkFmt;
+            if (srcFmt == QImage::Format_RGB32)
+                ivInfo.components.a = VK_COMPONENT_SWIZZLE_ONE;
             ivInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             if (vkCreateImageView(dev, &ivInfo, nullptr, &gpuTex.view) != VK_SUCCESS) {
                 vmaDestroyImage(alloc, gpuTex.image, gpuTex.alloc);
                 return false;
             }
+            if (sImgProfile) {
+                vkImgUs += (imgProfTimer.nsecsElapsed() / 1000) - ti0;
+                if (imgBytes >= 1024 * 1024) {
+                    std::fprintf(stderr, "  [IMG_BIG] slot=%zu gen=%llu %ux%u fmt=%d key=0x%llx\n",
+                                 i, static_cast<unsigned long long>(entry.generation),
+                                 w, h, int(srcFmt),
+                                 static_cast<unsigned long long>(entry.sourceCacheKey));
+                }
+            }
+            ++uploadedCount;
 
             f.pendingImageCopies.push_back({ gpuTex.image, writeCursor, w, h });
             writeCursor += imgBytes;
@@ -1835,6 +1889,13 @@ static bool syncArenaImagesAndCurves(QPhaseVulkanBackendData *d,
 
         if (writeCursor > 0)
             vmaFlushAllocation(alloc, f.stagingAlloc, 0, writeCursor);
+
+        if (sImgProfile && uploadedCount > 0) {
+            std::fprintf(stderr, "[PhaseProfile IMG] n=%u bytes=%.2fMB waitIdle=%.2fms stgAlloc=%.2fms memcpy=%.2fms vkImg=%.2fms\n",
+                         uploadedCount, double(totalUploadBytes) / (1024.0 * 1024.0),
+                         double(waitIdleUs) / 1000.0, double(stgAllocUs) / 1000.0,
+                         double(memcpyUs) / 1000.0, double(vkImgUs) / 1000.0);
+        }
     }
 
     if (!descWrites.empty()) {
