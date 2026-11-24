@@ -504,13 +504,21 @@ void QPhasePaintEngine::emitRasterFallback(const QRectF &localBounds,
     if (padded.width() <= 0.0 || padded.height() <= 0.0)
         return;
 
-    const int pxW = std::clamp(int(std::ceil(padded.width() * m_dpr)), 1, 2048);
-    const int pxH = std::clamp(int(std::ceil(padded.height() * m_dpr)), 1, 2048);
+    // Never truncate wide/tall fallback primitives (e.g. wide item-view selections on HiDPI):
+    // support up to 8192px natively and gracefully scale down if a primitive exceeds 8192px.
+    constexpr int kMaxFallbackDim = 8192;
+    const double rawW = std::ceil(padded.width() * m_dpr);
+    const double rawH = std::ceil(padded.height() * m_dpr);
+    const int pxW = std::clamp(int(rawW), 1, kMaxFallbackDim);
+    const int pxH = std::clamp(int(rawH), 1, kMaxFallbackDim);
+    const double scaleX = double(pxW) / padded.width();
+    const double scaleY = double(pxH) / padded.height();
 
     uint64_t h = extraHash;
     h = hashVal(h, pxW);
     h = hashVal(h, pxH);
-    h = hashVal(h, m_dpr);
+    h = hashVal(h, scaleX);
+    h = hashVal(h, scaleY);
     h = hashVal(h, m_antialiasing);
     const QPointF lbOrigin = localBounds.topLeft();
     h = hashVal(h, lbOrigin);
@@ -524,11 +532,11 @@ void QPhasePaintEngine::emitRasterFallback(const QRectF &localBounds,
     uint32_t slot = m_imageCache.acquireHashedRaster(m_arena, h, QImage());
     if (slot == UINT32_MAX) {
         QImage img(pxW, pxH, QImage::Format_RGBA8888_Premultiplied);
-        img.setDevicePixelRatio(m_dpr);
         img.fill(Qt::transparent);
         {
             QPainter rp(&img);
             rp.setRenderHint(QPainter::Antialiasing, m_antialiasing);
+            rp.scale(scaleX, scaleY);
             rp.translate(-padded.topLeft());
             rp.setTransform(m_transform, true);
             rp.setPen(m_pen);
@@ -549,8 +557,8 @@ void QPhasePaintEngine::emitRasterFallback(const QRectF &localBounds,
     p.resourceIndex = slot;
     p.x = float(padded.x());
     p.y = float(padded.y());
-    p.w = float(double(pxW) / m_dpr);
-    p.h = float(double(pxH) / m_dpr);
+    p.w = float(padded.width());
+    p.h = float(padded.height());
     p.c0r = 1.0f;
     p.c0g = 1.0f;
     p.c0b = 1.0f;
@@ -621,13 +629,21 @@ void QPhasePaintEngine::emitRectOrRounded(const QRectF &r, float rx, float ry)
     QPhaseVisuals vis(&vp);
 
     QPhaseBoxStyle style{};
-    style.radius = QPhaseCorners::all(std::max(0.0f, rx));
+    QRectF boxR = r;
+    float outerR = std::max(0.0f, rx);
     style.fill = hasFill ? fill : QPhaseFill::solid(QColor(0, 0, 0, 0));
     if (hasStroke) {
-        style.border.width = effectivePenWidth(m_pen);
+        // QPainter strokes centered on the rect boundary while QPhaseBoxStyle insets the border
+        const float bw = effectivePenWidth(m_pen);
+        const float halfW = bw * 0.5f;
+        boxR = r.adjusted(-halfW, -halfW, halfW, halfW);
+        if (outerR > 0.0f)
+            outerR += halfW;
+        style.border.width = bw;
         style.border.color = m_pen.color();
     }
-    vis.roundedBox(r, style);
+    style.radius = QPhaseCorners::all(outerR);
+    vis.roundedBox(boxR, style);
     for (const PhaseGpuPrimitive &p : vp.recordedPrimitives)
         pushPrimitiveClipped(p);
 }
@@ -638,7 +654,7 @@ void QPhasePaintEngine::drawRects(const QRect *rects, int rectCount)
     for (int i = 0; i < rectCount; ++i) {
         QRectF rf(rects[i]);
         if (hasStroke)
-            rf.adjust(0.0, 0.0, 1.0, 1.0);
+            rf.adjust(0.5, 0.5, 0.5, 0.5);
         emitRectOrRounded(rf, 0.0f, 0.0f);
     }
 }
@@ -785,33 +801,78 @@ bool QPhasePaintEngine::tryEmitFastPath(const QPainterPath &path)
         }
     }
 
-    // 2. QPainter::drawRoundedRect produces a 17-element path (MoveTo + 4*(LineTo + CurveTo))
-    //    or 5-element axis-aligned rectangle path. Detect both analytically!
-    if (n == 17 && path.elementAt(0).type == QPainterPath::MoveToElement) {
-        // Qt's QPainterPath::addRoundedRect pattern:
-        // 0:M(right, top+ry), 1:C..3(right-rx, top), 4:L(left+rx, top),
-        // 5:C..7(left, top+ry), 8:L(left, bottom-ry),
-        // 9:C..11(left+rx, bottom), 12:L(right-rx, bottom),
-        // 13:C..15(right, bottom-ry), 16:L(right, top+ry)
-        const bool matchesPattern =
-                path.elementAt(1).type == QPainterPath::CurveToElement
-                && path.elementAt(4).type == QPainterPath::LineToElement
-                && path.elementAt(5).type == QPainterPath::CurveToElement
-                && path.elementAt(8).type == QPainterPath::LineToElement
-                && path.elementAt(9).type == QPainterPath::CurveToElement
-                && path.elementAt(12).type == QPainterPath::LineToElement
-                && path.elementAt(13).type == QPainterPath::CurveToElement
-                && path.elementAt(16).type == QPainterPath::LineToElement;
-        if (matchesPattern) {
-            const QRectF br = path.boundingRect();
-            const qreal rx = std::abs(br.right() - path.elementAt(3).x);
-            const qreal ry = std::abs(path.elementAt(0).y - br.top());
-            if (rx > 0.0 && std::abs(rx - ry) < 0.25
-                && std::abs(path.elementAt(0).x - br.right()) < 0.05
-                && std::abs(path.elementAt(3).y - br.top()) < 0.05
-                && std::abs(path.elementAt(7).x - br.left()) < 0.05
-                && std::abs(path.elementAt(11).y - br.bottom()) < 0.05) {
-                emitRectOrRounded(br, float(rx), float(ry));
+    // 2. Orientation-independent rounded rectangle detector (handles Qt 6 QPainterPath::addRoundedRect
+    //    which emits 18 elements starting at br.left(), 17-element variants, and capsules/pills!).
+    if (n >= 13 && n <= 19 && path.elementAt(0).type == QPainterPath::MoveToElement) {
+        const QRectF br = path.boundingRect();
+        if (br.width() > 0.0 && br.height() > 0.0) {
+            constexpr qreal kTol = 0.1;
+            auto onVertical = [&](qreal x) {
+                return std::abs(x - br.left()) < kTol || std::abs(x - br.right()) < kTol;
+            };
+            auto onHorizontal = [&](qreal y) {
+                return std::abs(y - br.top()) < kTol || std::abs(y - br.bottom()) < kTol;
+            };
+
+            bool valid = true;
+            int cubicCount = 0;
+            qreal detectedRx = -1.0;
+            qreal detectedRy = -1.0;
+            QPointF cur(path.elementAt(0).x, path.elementAt(0).y);
+            if (!onVertical(cur.x()) && !onHorizontal(cur.y()))
+                valid = false;
+
+            for (int i = 1; i < n && valid; ) {
+                const auto el = path.elementAt(i);
+                if (el.type == QPainterPath::LineToElement) {
+                    const QPointF next(el.x, el.y);
+                    // Must stay along a single outer edge of br (or zero-length move/arc join)
+                    const bool sameEdge = (std::abs(next.x() - cur.x()) < kTol && onVertical(next.x()))
+                            || (std::abs(next.y() - cur.y()) < kTol && onHorizontal(next.y()));
+                    if (!sameEdge)
+                        valid = false;
+                    cur = next;
+                    ++i;
+                } else if (el.type == QPainterPath::CurveToElement && i + 2 < n
+                           && path.elementAt(i + 1).type == QPainterPath::CurveToDataElement
+                           && path.elementAt(i + 2).type == QPainterPath::CurveToDataElement) {
+                    const QPointF c1(el.x, el.y);
+                    const QPointF c2(path.elementAt(i + 1).x, path.elementAt(i + 1).y);
+                    const QPointF end(path.elementAt(i + 2).x, path.elementAt(i + 2).y);
+                    const bool vToH = onVertical(cur.x()) && onHorizontal(end.y());
+                    const bool hToV = onHorizontal(cur.y()) && onVertical(end.x());
+                    if (!vToH && !hToV) {
+                        valid = false;
+                        break;
+                    }
+                    // Verify control points stay tangent to the corner edges
+                    const bool tangentsOk = vToH
+                            ? (std::abs(c1.x() - cur.x()) < kTol && std::abs(c2.y() - end.y()) < kTol)
+                            : (std::abs(c1.y() - cur.y()) < kTol && std::abs(c2.x() - end.x()) < kTol);
+                    const qreal rx = std::abs(end.x() - cur.x());
+                    const qreal ry = std::abs(end.y() - cur.y());
+                    if (!tangentsOk || rx <= 0.0 || ry <= 0.0) {
+                        valid = false;
+                        break;
+                    }
+                    if (cubicCount == 0) {
+                        detectedRx = rx;
+                        detectedRy = ry;
+                    } else if (std::abs(rx - detectedRx) > 0.25 || std::abs(ry - detectedRy) > 0.25) {
+                        valid = false;
+                        break;
+                    }
+                    ++cubicCount;
+                    cur = end;
+                    i += 3;
+                } else {
+                    valid = false;
+                }
+            }
+
+            if (valid && cubicCount == 4 && detectedRx > 0.0 && detectedRy > 0.0
+                && std::abs(detectedRx - detectedRy) < 0.25) {
+                emitRectOrRounded(br, float(detectedRx), float(detectedRy));
                 return true;
             }
         }
@@ -1058,20 +1119,22 @@ void QPhasePaintEngine::drawTextItem(const QPointF &p, const QTextItem &textItem
     if (!rawFont.isValid())
         return;
 
-    const int n = ti.glyphs.numGlyphs;
+    // Reuse QFontEngine::getGlyphPositions() directly so RightToLeft (Arabic/Hebrew),
+    // kashidas, combining mark offsets, and dontPrint attributes match Qt's raster engine 1:1!
+    QVarLengthArray<glyph_t> outGlyphs;
+    QVarLengthArray<QFixedPoint> outPositions;
+    ti.fontEngine->getGlyphPositions(ti.glyphs, QTransform(), ti.flags, outGlyphs, outPositions);
+    if (outGlyphs.isEmpty())
+        return;
+
+    const int n = outGlyphs.size();
     QList<quint32> glyphIndexes;
     QList<QPointF> positions;
     glyphIndexes.reserve(n);
     positions.reserve(n);
-
-    QFixed x = 0;
-    QFixed y = 0;
     for (int i = 0; i < n; ++i) {
-        glyphIndexes.append(ti.glyphs.glyphs[i]);
-        const QFixed gx = x + ti.glyphs.offsets[i].x;
-        const QFixed gy = y + ti.glyphs.offsets[i].y;
-        positions.append(QPointF(gx.toReal(), gy.toReal()));
-        x += ti.glyphs.advances[i];
+        glyphIndexes.append(outGlyphs[i]);
+        positions.append(outPositions[i].toPointF());
     }
 
     QGlyphRun run;
