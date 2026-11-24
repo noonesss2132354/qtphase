@@ -382,9 +382,11 @@ uint32_t QPhaseSceneArena::allocatePrimitive(const PhaseGpuPrimitive &prim)
         idx = m_freePrimitives.back();
         m_freePrimitives.pop_back();
         m_primitives[idx] = prim;
+        m_primSlotGens[idx] = ++m_nextPrimAllocGen;
     } else {
         idx = uint32_t(m_primitives.size());
         m_primitives.push_back(prim);
+        m_primSlotGens.push_back(++m_nextPrimAllocGen);
     }
     if (hasActiveAnimBits(prim.animMode))
         ++m_activeAnimCount;
@@ -1363,6 +1365,7 @@ QPhaseDamageFrameSnapshot QPhaseDamageFrameSnapshot::capture(QPhaseSceneArena &a
     const float dpr = float(devicePixelRatio);
 
     const auto &prims = arena.primitives();
+    const auto &primGens = arena.primitiveSlotGenerations();
     const auto &transforms = arena.resolvedTransforms();
     const auto &clips = arena.resolvedClips();
     const auto &order = arena.drawOrder();
@@ -1399,7 +1402,9 @@ QPhaseDamageFrameSnapshot QPhaseDamageFrameSnapshot::capture(QPhaseSceneArena &a
         }
 
         const auto quantOp = uint16_t(std::clamp(int(std::lround(effOp * 512.0f)), 0, 512));
-        const uint64_t hash = hashPrimitiveAppearance(p, tx, cl, quantOp, imgGen);
+        const uint64_t slotGen = (idx < primGens.size()) ? primGens[idx] : 0ULL;
+        const uint64_t hash = hashPrimitiveAppearance(p, tx, cl, quantOp, imgGen)
+                ^ (slotGen * 0x9E3779B97F4A7C15ULL);
 
         PhasePrimDamageSlot &slot = snap.primSlots[idx];
         if (!slot.active) {
@@ -1522,12 +1527,13 @@ QRegion QPhaseDamageTracker::diffAndAdvance(const QPhaseDamageFrameSnapshot &sna
         const PhasePrimDamageSlot &cur = snap.primSlots[idx];
         if (idx >= m_prevSlots.size() || !m_prevSlots[idx].active) {
             addDirtyRect(cur.devBounds);
+        } else if (m_prevSlots[idx].contentHash != cur.contentHash) {
+            // Modified or recycled slot: both old and new bounds are already marked dirty,
+            // so exclude from relative z-order diff to avoid false cascade across shifted indices!
+            addDirtyRect(m_prevSlots[idx].devBounds);
+            addDirtyRect(cur.devBounds);
         } else {
             survivingCurOrder.push_back(idx);
-            if (m_prevSlots[idx].contentHash != cur.contentHash) {
-                addDirtyRect(m_prevSlots[idx].devBounds);
-                addDirtyRect(cur.devBounds);
-            }
         }
     }
 
@@ -1537,6 +1543,8 @@ QRegion QPhaseDamageTracker::diffAndAdvance(const QPhaseDamageFrameSnapshot &sna
         if (oldIdx >= snap.primSlots.size() || !snap.primSlots[oldIdx].active) {
             if (oldIdx < m_prevSlots.size() && m_prevSlots[oldIdx].active)
                 addDirtyRect(m_prevSlots[oldIdx].devBounds);
+        } else if (oldIdx < m_prevSlots.size() && m_prevSlots[oldIdx].contentHash != snap.primSlots[oldIdx].contentHash) {
+            // Already handled above
         } else {
             survivingPrevOrder.push_back(oldIdx);
         }

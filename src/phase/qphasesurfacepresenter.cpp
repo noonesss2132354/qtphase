@@ -164,8 +164,17 @@ public:
     bool swapchainFallbackAttached = false;
     float reportedDirtyAreaRatio = 1.0f;
 
+    struct CpuBootBufferState {
+        void *handle = nullptr;
+        QSize pxSize;
+        qreal dpr = 0.0;
+        bool initialized = false;
+        QRegion accumulatedDamage;
+    };
+
     std::unique_ptr<QPhaseCpuRasterizer> cpuRasterizer;
     QPhaseDamageTracker cpuDamageTracker;
+    std::vector<CpuBootBufferState> cpuBootBufferStates;
     std::unique_ptr<QPhaseVulkanBackend> vulkanBackend;
     std::thread cpuCalibThread;
 
@@ -283,6 +292,7 @@ void QPhaseSurfacePresenter::onSurfaceHidden()
     d->lastDispatchedDpr = 0.0;
     d->uiArena.resetGpuSteadyState();
     d->cpuDamageTracker.reset();
+    d->cpuBootBufferStates.clear();
     d->permanentLockActive = false;
     d->hasPresentedFrame = false;
     d->phase = Phase::WorkerRace;
@@ -411,6 +421,7 @@ void QPhaseSurfacePresenter::finalizeWinner(Phase winningPhase)
         if (d->uiArena.rendererRequirements().cpuOnlyViewCount == 0)
             d->cpuRasterizer.reset();
         d->cpuDamageTracker.reset();
+        d->cpuBootBufferStates.clear();
         d->uiArena.markEnteredGpuSteadyState();
         if (d->window && d->window->handle()) {
             d->window->handle()->releasePhasedBootResources();
@@ -491,26 +502,70 @@ bool QPhaseSurfacePresenter::presentCpuFrame(QPlatformWindow *pw,
     const QRegion dmgRegion = d->cpuDamageTracker.computeAndAdvance(
             d->uiArena, pxSize, dpr, frameTimeNs, &isFullDmg, QPhaseRendererAffinity::CpuOnly);
 
-    const bool finished = d->cpuRasterizer->renderToBuffer(
-            d->uiArena,
-            bootBuf.data,
-            bootBuf.width,
-            bootBuf.height,
-            bootBuf.bytesPerLine,
-            dpr,
-            !hasAlpha,
-            frameTimeNs,
-            nullptr,
-            0,
-            nullptr);
+    // Maintain exact per-buffer damage history across the wl_shm ring (up to 4 buffers)
+    // so every partial CPU frame rasterizes ONLY tiles modified since THIS buffer was last painted!
+    for (auto &bs : d->cpuBootBufferStates) {
+        if (isFullDmg || bs.pxSize != pxSize || !qFuzzyCompare(bs.dpr, dpr)) {
+            bs.initialized = false;
+            bs.accumulatedDamage = QRegion();
+        } else if (!dmgRegion.isEmpty()) {
+            bs.accumulatedDamage += dmgRegion;
+        }
+    }
+
+    QPhaseSurfacePresenterPrivate::CpuBootBufferState *curState = nullptr;
+    for (auto &bs : d->cpuBootBufferStates) {
+        if (bs.handle == bootBuf.handle) {
+            curState = &bs;
+            break;
+        }
+    }
+    if (!curState) {
+        if (d->cpuBootBufferStates.size() >= 8)
+            d->cpuBootBufferStates.erase(d->cpuBootBufferStates.begin());
+        d->cpuBootBufferStates.push_back({ bootBuf.handle, pxSize, dpr, false, QRegion() });
+        curState = &d->cpuBootBufferStates.back();
+    }
+
+    const bool usePartial = curState->initialized
+            && !isFullDmg
+            && curState->pxSize == pxSize
+            && qFuzzyCompare(curState->dpr, dpr);
+    const QRegion renderDamage = usePartial ? curState->accumulatedDamage : QRegion();
+    const quint64 totalPx = quint64(pxSize.width()) * quint64(pxSize.height());
+    const bool passDamageRegion = usePartial
+            && !renderDamage.isEmpty()
+            && (QPhaseDamageTracker::regionPixelArea(renderDamage) * 4ull < totalPx * 3ull);
+
+    bool finished = true;
+    if (!usePartial || !renderDamage.isEmpty()) {
+        finished = d->cpuRasterizer->renderToBuffer(
+                d->uiArena,
+                bootBuf.data,
+                bootBuf.width,
+                bootBuf.height,
+                bootBuf.bytesPerLine,
+                dpr,
+                !hasAlpha,
+                frameTimeNs,
+                nullptr,
+                0,
+                passDamageRegion ? &renderDamage : nullptr);
+    }
     const qint64 cpuWorkUs = t.nsecsElapsed() / 1000;
     if (outCpuWorkUs)
         *outCpuWorkUs = cpuWorkUs;
 
     if (!finished) {
         d->cpuDamageTracker.reset();
+        d->cpuBootBufferStates.clear();
         return false;
     }
+
+    curState->pxSize = pxSize;
+    curState->dpr = dpr;
+    curState->initialized = true;
+    curState->accumulatedDamage = QRegion();
 
     QRegion logicalDmg;
     if (!isFullDmg && !dmgRegion.isEmpty()) {
@@ -830,6 +885,7 @@ void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
     if (switchingBackend && d->lastPresentedBackend == QPhaseBackendTarget::Gpu) {
         d->uiArena.resetGpuSteadyState();
         d->cpuDamageTracker.reset();
+        d->cpuBootBufferStates.clear();
         // Re-populate CPU QImage references (zero-copy!) if GPU steady-state already cleared them
         if (d->restoreCpuImagesCallback && d->syncCallback
             && d->uiArena.activeImageSlotCount() > 0 && d->uiArena.activeCpuImageBytes() == 0) {
@@ -856,10 +912,11 @@ void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
         d->lastDispatchedPxSize = pxSize;
         d->lastDispatchedDpr = dpr;
         if (sProfile) {
-            std::fprintf(stderr, "[PhaseProfile CPU] seq=%llu px=%dx%d sync=%.2fms raster=%.2fms [%s:%s]\n",
+            std::fprintf(stderr, "[PhaseProfile CPU] seq=%llu px=%dx%d sync=%.2fms raster=%.2fms dirty=%.0f%% [%s:%s]\n",
                          static_cast<unsigned long long>(++d->nextFrameSeq),
                          pxSize.width(), pxSize.height(), double(syncUs) / 1000.0,
                          double(cpuWorkUs) / 1000.0,
+                         double(freq.dirtyAreaRatio) * 100.0,
                          d->policy->name(), decision.reason ? decision.reason : "");
         }
         if (decision.lockPermanent && !d->permanentLockActive)

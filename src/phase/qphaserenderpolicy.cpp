@@ -215,7 +215,7 @@ public:
 
         const bool heavyFrame = req.isResize || req.sizeChanged || req.hasActiveAnimations
                 || req.dirtyAreaRatio >= 0.25f;
-        const bool tinyEdit = !heavyFrame && req.dirtyAreaRatio > 0.0f && req.dirtyAreaRatio < 0.08f
+        const bool tinyEdit = !heavyFrame && req.dirtyAreaRatio > 0.0f && req.dirtyAreaRatio < 0.15f
                 && req.pendingUploadBytes < (512 * 1024);
 
         // Track consecutive streaks for hysteresis

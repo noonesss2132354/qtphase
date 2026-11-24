@@ -300,6 +300,7 @@ public:
     const std::vector<PhaseResolvedTransform> &resolvedTransforms() const noexcept { return m_resolvedTransforms; }
     const std::vector<PhaseResolvedClip> &resolvedClips() const noexcept { return m_resolvedClips; }
     const std::vector<PhaseGpuPrimitive> &primitives() const noexcept { return m_primitives; }
+    const std::vector<uint64_t> &primitiveSlotGenerations() const noexcept { return m_primSlotGens; }
     const std::vector<uint64_t> &primitivePageRevisions() const noexcept { return m_primPageRevisions; }
     const std::vector<uint32_t> &drawOrder() const noexcept { return m_drawOrder; }
 
@@ -325,8 +326,10 @@ private:
     std::vector<uint32_t> m_freeClips;
 
     std::vector<PhaseGpuPrimitive> m_primitives;
+    std::vector<uint64_t> m_primSlotGens;
     std::vector<uint64_t> m_primPageRevisions;
     std::vector<uint32_t> m_freePrimitives;
+    uint64_t m_nextPrimAllocGen = 1;
     std::vector<uint32_t> m_drawOrder;
 
     // Stage 3 images + FIFO cooldown bindless free-list (prevents in-flight descriptor overwrites!)
