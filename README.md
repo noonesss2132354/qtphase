@@ -1,9 +1,28 @@
 # QtPhase — Retained Hybrid CPU / Vulkan 1.3 Renderer for Unmodified Qt Widgets
 
-> **Status: Experimental Research POC & Architecture Handoff**  
+> **Status: Experimental POC & Vibe coded slop
 > This branch (`feat/qtphase-renderer`, based on `qtbase v6.11.2`) is an open research proof-of-concept exploring what happens when you back stock **Qt Widgets** on Linux Wayland with a **retained per-widget scene arena**, **Vulkan 1.3 SDF + HarfBuzz `hb-gpu` analytical curve text**, and **pluggable CPU-vs-GPU scheduling policies** — with **zero public Qt Widgets API changes**.
 >
-> **I am not planning to maintain a Qt fork.** This repository, its demos, its benchmark harnesses, its pixel-diff artifacts, and its empirical findings (including failed hypotheses) are published for KDE, Qt, Mesa, and UI/graphics engineers to inspect, reproduce on other hardware, borrow ideas from, or take further.
+> TLDR: We don't have to create new GUI libraries from scratch to offload stuff to the GPU more. By making changes in even legacy GUI libraries, we can achieve modern top of the line latency, performance and efficiency. Closest to what this became would be GPUi, but this project has quirks of its own.
+>
+> This started when I was refreshing my mind about GUI toolkit rendering strategies. CPU rasterization has lower latency but its throughput is far lower than GPU based pipelines, which have higher FPS. The main goal initially was to explore a strategy with whereby the program uses CPU rasterization until the GPU pipeline becomes ready, by which point we would seemlessly transition to the GPU to get the benefit of higher FPS. Both pipelines would have a single dev facing API to draw stuff. Unfortunately I don't know Vulkan or low level GPU programming, so this project is vibe coded slop.
+> After a successful POC with a custom widget library (which is included), I tried to challenge my own assumption that the GPU would be faster and made the pipelines race for fun! The CPU would start in the beginning until Vulkan began drawing its first frames. Then, whichever pipeline is faster for 5 frames consecutively would win and be used exclusively (the GPU was, but making them race was fun).
+> After that, I was bored with the custom widget set and wanted to start Dolphin with this thing, so QT was gutted to allow for a scene graph backed QWidgets library (which mostly works, aside from a few unoptimal widget implementations! Tested with dolphin, konsole, okular and custom test programs)
+> Another fun idea was to add in support for arbitrary pipeline switching policies (basically governors) (we had tried strict CPU to GPU switching and racing so far). I made the LLM come up with a few algos by itself, and the results are below. Initially those policies only had window scope metrics to rely on.
+> Lastly I experimented with Widget-specific overrides for rendering pipelines, as well as allowing policies to get access to information about specific widgets
+>
+> Unfortunately since I'm a dummy and not proficient in GPU stuff, I can't distill the information myself. I asked the LLM to do that below. My hope is that despite the fact that this is vibe coded, that lessons could be learned from this, and that competent people could perhaps use it in the real world.
+> Some screenshots have been modified (Dolphin) to hide info about me. But folders and everything displays correctly. Menus lag sometimes though. Some screenshots are from earlier in the process (examples/phase/iamges). I encourage you to compile and test this if you're into this.
+
+---
+
+## Live Unmodified KDE Apps Running on QtPhase Vulkan 1.3
+
+### Stock `/usr/bin/dolphin` (Breeze Dark, RTL Arabic, HarfBuzz `hb-gpu` Text & Retained Scene Arena)
+![Stock Dolphin running unmodified on QtPhase Vulkan 1.3](examples/phase/images/screenshot1.png)
+
+### Stock `/usr/bin/okular` (20-Page PDF, Zero-Copy `B8G8R8A8_UNORM` Uploads & Bucketed DMA-BUF Scanout)
+![Stock Okular rendering 20-page PDF unmodified on QtPhase Vulkan 1.3](examples/phase/images/Screenshot2.png)
 
 ---
 
@@ -22,7 +41,7 @@ Measured on Fedora Linux, KWin Wayland, AMD Renoir integrated GPU (1.5× DPR), B
 | **Popup menu churn** (`QMenu`, p50) | `3.95 ms` | **`1.19–1.38 ms`** (`0.53 ms` CPU render, `0` Vulkan rings) | **~3× faster** |
 | **Cold startup to 1st commit** (Dolphin / Okular, 3-run mean) | `234.6 ms` / `410.5 ms` | **`225.6 ms`** / **`410.2 ms`** | **No regression** (zero-wait CPU boot) |
 
-> **Honest caveat on RAM**: Okular Peak RSS increased from `290.8 MB` (upstream) to `455–492 MB` on most GPU policies (`316.2 MB` on `upload-aware`), due to Vulkan driver overhead + DMA-BUF scanout rings + staging/image residency. See [Known Limitations & Open Research Questions](#7-verdict-known-limitations--open-research-questions).
+> **Honest caveat on RAM**: Okular Peak RSS increased from `290.8 MB` (upstream) to `455–492 MB` on most GPU policies (`316.2 MB` on `upload-aware`), due to Vulkan driver overhead + DMA-BUF scanout rings + staging/image residency. See [Known Limitations & Open Research Questions](#8-verdict-known-limitations--open-research-questions).
 
 ---
 
@@ -43,11 +62,7 @@ From that initial premise, the design evolved through five concrete decisions:
 
 ## 2. Visual Verification: Screenshots & Pixel Diffs
 
-### 2.1 Unmodified Qt Widgets & Real KDE Applications on QtPhase Vulkan 1.3
-
-| Stock `/usr/bin/dolphin` (RTL Arabic, Breeze Dark — fixed) | Stock `/usr/bin/okular` (20-page PDF, zero-copy BGRA Vulkan 1.3) |
-| :---: | :---: |
-| ![Stock Dolphin RTL Arabic on QtPhase Vulkan 1.3](examples/phase/images/dolphin_rtl_fixed.png) | ![Stock Okular 20-page PDF on QtPhase Vulkan 1.3](examples/phase/images/okular_phase_bgra_dump.png) |
+### 2.1 More Qt Widgets & Stress Suite Captures
 
 | Qt `WidgetGallery` (Breeze Dark, live Wayland DMA-BUF) | `widgets_phase_demo` (50k-row `QTableView` + custom `QPainter` waveform, 0 QtPhase includes) |
 | :---: | :---: |
@@ -132,9 +147,60 @@ flowchart TD
 | **CPU Tile Rasterizer** | [qphasecpurasterizer.cpp](src/phase/cpu/qphasecpurasterizer.cpp), [qphasesharedmath_p.h](src/phase/cpu/qphasesharedmath_p.h) | Multi-threaded 16×16 tile rasterizer sharing exact SDF/blend/stem-darkening math with Vulkan, with per-buffer damage-region clipping |
 | **Wayland Integration** | [qwaylandphasedwindow.cpp](src/plugins/platforms/wayland/qwaylandphasedwindow.cpp) | Dual `wl_shm` + `zwp_linux_dmabuf_v1` + `wp_viewport.set_source` atomic main-thread commit on a single `wl_surface` |
 
+### What Makes Both Pipelines Special
+
+Most hybrid UI architectures either run two completely unrelated renderers (e.g., Skia CPU vs. GPU with divergent code paths) or hard-partition rendering at the toolkit boundary. QtPhase's two pipelines are designed from the ground up as **twin executors over a single retained scene arena** (`QPhaseSceneArena`), sharing exact analytical math (`qphasesharedmath_p.h`) and presenting atomically to the **same `wl_surface`** (`QWaylandPhasedWindow`):
+
+#### 1. The Retained Scene Arena & Frontend Seam (`QPhaseSceneArena` + `QPhaseWidgetBridge`)
+- **Zero-`paintEvent` widget moves & sub-rect primitive splicing**: Every `QWidget` owns retained transform, clip, and primitive slots. Moving a widget updates a 32-byte `PhaseResolvedTransform` (full 2×2 affine matrix + opacity) without invoking `paintEvent()`. Small updates inside opaque viewports (`KItemListView`, `QTreeView`, `QTextEdit`) splice only the dirty sub-rect's primitives in place.
+- **Zero-allocation monochrome glyph submission**: `QPhasePaintEngine::drawTextItem()` caches `hb_face_t` color-table flags once per face, caches whitespace glyphs as `0u`, and emits monochrome glyph runs directly into the primitive buffer with zero `QRawFont`/`QList`/`QGlyphRun` heap churn — accelerating *both* CPU and GPU pipelines.
+- **Atomic dual-transport Wayland surface**: `QWaylandPhasedWindow` switches transparently between `wl_shm` (CPU) and `zwp_linux_dmabuf_v1` (GPU) on the exact same `wl_surface` without recreating windows, losing input focus, or flickering.
+
+#### 2. The Vulkan 1.3 GPU Pipeline (`QPhaseVulkanBackend`)
+- **No `VkSwapchainKHR` on Wayland — 256 px-Bucketed Tiled DMA-BUF Scanout**: Conventional Wayland Vulkan apps stall for `5–25 ms` tearing down and recreating `VkSwapchainKHR` on every pixel of a resize drag and fight cross-thread `ack_configure` races. QtPhase allocates 256 px-bucketed tiled GPU images (`VK_EXT_external_memory_dma_buf` + `SYNC_FD`) cropped cleanly via `wp_viewport.set_source` and committed on the main thread, dropping resize submit+present to **`0.4–0.7 ms`**.
+- **2-Stage `O(drawCount)` Coarse-to-Fine Compute Tile Binning**: `phase_prim_prep.comp` computes bounds and atomically populates 32-bit primitive visibility masks per `128×128` super-tile; `phase_tile_bin.comp` scans only set bits with `findLSB()` (skipping 32 non-overlapping primitives in one instruction) and tracks `lastFullOccluder` for front-to-back opaque culling — hitting **`0.16 ms`** GPU execution on localized updates at `2157×1496`.
+- **HarfBuzz 15 `hb-gpu` Analytical Curve Text + 1D `8×8`-Block Compute Baking**: Glyphs and SVG vectors are stored once as unscaled Bézier curve blobs in Buffer Device Address (BDA) VRAM (zero font-size glyph-atlas thrashing). `phase_glyph_bake.comp` bakes only cache-missed `8×8` blocks into a process-shared `2048×2048 R8_UNORM` scratch atlas (**97.8% hit rate** on live `phase_demo`), removing all ~220 lines of Bézier root-solving loops from `phase_uber.frag`.
+- **Zero-VRAM Single-Pass Layer Stack & Nested Rounded Clips**: `phase_uber.frag` evaluates 4-hop nested rounded-clip chains and a 3-deep in-register `PushLayer`/`PopLayer` group-opacity & blend stack (`Normal`, `Multiply`, `Screen`, `Additive`) in a single render pass with **`0 MB` of offscreen FBO allocations**.
+- **Process-Wide Shared `QPhaseSharedVulkanDevice` + Zero-Stall Bindless Uploads**: All windows share one `VkDevice`, VMA allocator, compiled pipelines, and glyph atlas (`~200 µs` secondary window init, `0 B` VRAM when all GPU surfaces close). Images upload via batched DMA staging (zero-copy `ARGB32_Premultiplied`/`RGB32` → `VK_FORMAT_B8G8R8A8_UNORM`), bindless slots recycle via FIFO cooldown (zero pipeline stalls), and per-slot damage trackers preserve unchanged pixels via `VK_ATTACHMENT_LOAD_OP_LOAD` + up to 8 scissor draws.
+
+#### 3. The CPU Tile-Pool Pipeline (`QPhaseCpuRasterizer` + `QPhaseSurfacePresenter`)
+- **Zero-Wait Cold Start & Zero-VRAM Transient Windows**: Paints Frame 1 immediately into 256-byte-aligned `memfd` `wl_shm` buffers while Vulkan warms up asynchronously, and handles short-lived `Qt::Popup`/`Qt::ToolTip` windows permanently in **`0.53 ms`** without allocating Vulkan DMA-BUF rings.
+- **Bit-Exact Shared Analytical Math + HarfBuzz `hb-raster`**: Multi-threaded `16×16` tile workers evaluate the exact same SDF rounded boxes, `erf` Gaussian shadows, 4-hop rounded clips, 3-deep in-register `PushLayer`/`PopLayer` blend stack, and luminance-aware stem darkening as the Vulkan shaders (`0/255` diff on Stages 1, 2, and Stage 6 geometry/layers), paired with HarfBuzz 15 `hb-raster` for curves.
+- **Per-Buffer `wl_shm` Damage History**: Each `wl_shm` ring slot maintains its own `QPhaseDamageTracker` (using monotonic primitive slot generations `m_primSlotGens` to avoid free-list recycling false positives), so localized edits rasterize only dirty `16×16` tiles (**~10× faster** on `QTreeView` partial updates: `17.5–23.0 ms → 1.61–1.81 ms`).
+- **Live Conflict Bridge & Off-Thread Calibrator**: Doubles as an on-demand subtree rasterizer for `CpuOnly` widgets coexisting inside a GPU window (`Stage 7`, content-hashed so static subtrees cost `0 ns`), and runs asynchronous scene-clone calibrations (`cloneForCpuCalibration()`) off the UI thread so scheduling policies get genuine CPU timings with **`0 ms`** UI stall.
+
 ---
 
-## 4. The Full Investigation: Five Empirical Cycles & Falsified Hypotheses
+## 4. Overview of the 11 Scheduling Policies (`QPhaseRenderPolicy`)
+
+Every window is governed by a pluggable `QPhaseRenderPolicy` ([qphaserenderpolicy_p.h](src/phase/qphaserenderpolicy_p.h), [qphaserenderpolicy.cpp](src/phase/qphaserenderpolicy.cpp)) selected at runtime via `QT_PHASE_POLICY=<name>`. Before each frame, `QPhaseSurfacePresenter` calls `decide(QPhaseSurfaceCaps, QPhaseFrameRequest)` (passing hardware/software GPU status, popup/dialog flags, dirty area ratio, pending upload bytes, inter-frame interval, and dirty widget semantic hints) and reports back measured CPU work, Vulkan hardware timestamps (`VK_QUERY_TYPE_TIMESTAMP`), and off-thread CPU calibration timings via `recordOutcome()` and `recordAsyncCpuSample()`.
+
+> All adaptive policies respect explicit per-widget `QPhaseRendererAffinity` (`CpuOnly` / `GpuOnly` / `hasGpuOnlyViews`) and automatically fall back to CPU if Vulkan initialization fails.
+
+### Static & One-Way Race Policies (5)
+
+| Policy | Mechanism & Key Rules | Intended Use / Empirical Result |
+|---|---|---|
+| **`async-race`** *(default)* | Locks popups/tooltips and tiny Frame-0 surfaces (`≤ 320×240`) permanently to CPU `wl_shm`. Main windows boot on CPU during warmup, submit async GPU frames (`0 ms` stall) once warm, and trigger a 1-frame off-thread CPU clone calibration (`cloneForCpuCalibration()`). Once both GPU (`submit + hw`, min of initial frames) and CPU times arrive, locks permanently to GPU if `gpuCostUs ≤ cpuSampleUs + 1.5 ms` (else CPU). Software Vulkan still runs a 1-frame sync probe. | **Best overall latency winner today.** Zero startup stall, real CPU baseline (fixes Okular misclassification), zero mid-session switch spikes, `0.53 ms` CPU popups. |
+| **`sync-race`** | Original 1-frame synchronous probe baseline. Boots on CPU during warmup, runs 1 blocking GPU probe frame once warm, and compares `gpuHwUs < lastCpuUs` (falling back to a hardcoded `4.0 ms` guess if Vulkan warmed up before Frame 1). | **Falsified / superseded by `async-race`.** Misclassified Okular onto CPU (`64 ms` resize) whenever Vulkan warmed before Frame 1 because `4.93 ms > 4.0 ms` fake CPU guess. |
+| **`hw-gpu`** | Control baseline from `64ca68ff`. Hardware GPUs lock straight to Vulkan as soon as warmup finishes with zero probing; software Vulkan (`llvmpipe`) runs a 1-frame sync probe. | Fast static hardware baseline, but allocates GPU rings even for popups/tooltips and never empirically verifies GPU speed on hardware GPUs. |
+| **`cpu-only`** | Forces every surface and frame unconditionally onto `QPhaseCpuRasterizer` (`wl_shm`). | Pure CPU baseline for A/B comparison (and verifying per-buffer CPU partial-tile damage). |
+| **`gpu-only`** | Forces every surface (including popups/tooltips) onto Vulkan GPU once warm (falls back to CPU only on Vulkan failure). | Pure GPU baseline; highlighted popup ring allocation overhead (`0/11` CPU/GPU popups vs `async-race`'s `7/0`). |
+
+### Dynamic / Adaptive Hybrid Policies (6)
+
+| Policy | Mechanism & Key Rules | Intended Use / Empirical Result |
+|---|---|---|
+| **`dynamic-hybrid`** | Continuous EWMA-tracked (`3/4` decay) hysteresis switcher with CPU popups. Demotes GPU → CPU after `4` consecutive tiny localized edits (`dirty < 15%`, upload `< 512 KB`, `≥ 4` frames since switch) or `4` consecutive frames where GPU loses to CPU (`> 1.25× + 1 ms`). Promotes back immediately on resize/animation or `dirty ≥ 30%` (after `2`-frame cooldown). | **Thrashed on interactive workloads** (`8` switches on Dolphin, `KeyNav p90 = 12.23 ms`) because repeated `wl_shm` cold-buffer transitions hurt tail latency. |
+| **`amortized-hybrid`** | Breakeven-cost controller designed to fix `dynamic-hybrid` thrashing. Explicitly models the `~2×` full-frame `wl_shm` cold-init switch penalty and accumulates estimated partial-CPU savings per small frame (`dirty < 16%`, upload `< 512 KB`). Only demotes GPU → CPU after `≥ 10` consecutive small frames whose cumulative savings exceed the switch cost (or `6` GPU losses), and requires `2` consecutive large frames (`dirty ≥ 30%`) or resize/animation to promote back. | Cut switches in half vs. `dynamic-hybrid` and delivered the lowest Okular scroll tail (`p90 = 7.81 ms`), though a single switch still caused a `p90` spike on Dolphin `KeyNav`. |
+| **`cadence-power`** | Laptop/APU power-oriented cadence governor with CPU popups. Keeps fast interactive bursts (`< 65 ms` inter-frame gap with `dirty ≥ 20%`, resizes, animations) on GPU while clocks are boosted, and demotes after `3` consecutive sparse small updates (`≥ 140 ms` between frames, `dirty < 25%`, upload `< 512 KB` — slow typing, blinking cursors, 1 Hz ticks) to CPU partial-tile so the GPU stays asleep. Promotes immediately on resize/animation or `2` fast bursts. | **Cleanest power/idle hybrid.** `0` switches on Dolphin & Okular, and **1 clean switch** on Konsole during sparse `160 ms` typing (`2.62 ms` CPU, 0 GPU wakeups). Prime candidate for dGPU D3cold testing. |
+| **`upload-aware`** | Texture-churn guard with CPU popups. Keeps normal UI and intermittent uploads (like Okular PDF page arrivals) on GPU, but detects `4` consecutive non-resize frames with `pendingUploadBytes ≥ 512 KB` (e.g., animated `emitRasterFallback()` canvases) and demotes to CPU until `12` calm frames (`< 256 KB`) or resize. | **Falsified on speed.** Demoting animated fallback canvases was **2× slower** (`25.60 ms` vs `13.10 ms` GPU) because `emitRasterFallback()` already rasterizes to a `QImage`, causing double-rasterization on CPU. |
+| **`contextual-bandit`** | 2-context online learner (`SmallDamage`: `dirty < 18%`, non-resize/non-anim vs. `LargeDamage`) with CPU popups and zero hardcoded latency thresholds. Calibrates `LargeDamage` CPU off-thread; once `SmallDamage` has GPU data and `≥ 6` small frames, runs a 3-frame CPU probe (2 warm-up frames + 1 measured partial-damage frame). Picks `argmin(EWMA_cpu, EWMA_gpu)` whenever the alternative wins by `≥ 15%` (after `8`-frame cooldown, or immediately on resize), and re-probes every `150` large frames to adapt to GPU contention. | **Strongest adaptive performance learner.** Won Dolphin resize (`6.80 / 9.22 ms`), Dolphin `KeyNav` p90 (`2.26 ms` pre-glyph), and Okular scroll p50 (`1.99 ms`) with zero hand-tuned thresholds. |
+| **`widget-aware`** | Semantic widget-hint + cadence + calibration governor fed by Level-1 `QPhaseWidgetBridge` classification (`QPhaseSurfaceHint`). Permanently routes popups, tooltips, and small non-scrolling dialogs (`QDialog` `≤ 800×600` without scroll viewports) to CPU `wl_shm`. Keeps active `ScrollViewport`, `HeavyCanvas`, resize, and animation bursts on GPU; demotes `3` consecutive sparse localized `TextInput` / `ControlChrome` updates (`≥ 120 ms` gap, `dirty < 20%`, no heavy/scroll hints) to CPU partial-tile; falls back to CPU if software Vulkan loses after calibration. Pairs with Level-2 per-widget `CachedCpuRaster` (`QT_PHASE_WIDGET_HYBRID=correctness\|aggressive\|off`). | **Top-tier latency + semantic awareness.** Hit **`0.71 ms` p50** on Dolphin `KeyNav` while keeping popups, simple dialogs, and sparse chrome/text ticks off the GPU. |
+
+---
+
+## 5. The Full Investigation: Five Empirical Cycles & Falsified Hypotheses
 
 ### Cycle 1 — Core Pipeline, HarfBuzz `hb-gpu`, Game-Engine Upgrades & Affinity (`761ca65d`)
 - **Replacing our custom CPU text rasterizer with HarfBuzz `hb-raster`**: Inspecting early Stage 4 PNG diffs showed our custom CPU outline rasterizer carried maintenance burden for zero benefit over HarfBuzz 15's `hb-raster`, so both pipelines standardized on HarfBuzz (`hb-raster` CPU ↔ `hb-gpu` GPU).
@@ -168,12 +234,12 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 
 ---
 
-## 5. Full Benchmark Data
+## 6. Full Benchmark Data
 
 > **Environment**: Fedora Linux, KWin Wayland, AMD Renoir APU (1.5× DPR), Breeze Dark + KDE Plasma theme.  
-> **Note**: Sections 5.1–5.4 are the 36-run single-trial Policy Arena sweeps taken just before the Cycle 5 glyph fast path; Section 5.5 shows the updated runs on `1dd0c0ee`.
+> **Note**: Sections 6.1–6.4 are the 36-run single-trial Policy Arena sweeps taken just before the Cycle 5 glyph fast path; Section 6.5 shows the updated runs on `1dd0c0ee`.
 
-### 5.1 Konsole (Dense Monospace Terminal — Resize + Sparse `160 ms` Typing)
+### 6.1 Konsole (Dense Monospace Terminal — Resize + Sparse `160 ms` Typing)
 | Policy | Resize p50 | Resize p90 | Sparse Type p50 | Frames (CPU / GPU) | Switches | Avg CPU | Avg GPU HW |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `upstream` (`PHASE=0`) | `27.56 ms` | `34.70 ms` | `0.22 ms` | — | — | — | — |
@@ -188,7 +254,7 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 
 *Notable*: `cadence-power` stayed GPU during resize, then switched **once** (`Sw=1`) to CPU partial-tile (`2.62 ms`, 0 GPU wakeups) during sparse `160 ms` typing.
 
-### 5.2 Dolphin (File Manager — Resize + Rapid `Key_Down` Selection)
+### 6.2 Dolphin (File Manager — Resize + Rapid `Key_Down` Selection)
 | Policy | Resize p50 | Resize p90 | `KeyNav` p50 | `KeyNav` p90 | Frames (CPU / GPU) | Switches | Avg GPU HW |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `upstream` (`PHASE=0`) | `29.01 ms` | `36.19 ms` | `2.05 ms` | `2.53 ms` | — | — | — |
@@ -201,7 +267,7 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 | `cpu-only` | `32.60 ms` | `38.64 ms` | `4.12 ms` | `11.74 ms` | `126 / 0` | `0` | `0.00 ms` |
 | `gpu-only` | `7.63 ms` | `11.62 ms` | `1.99 ms` | `3.90 ms` | `0 / 128` | `0` | `1.74 ms` |
 
-### 5.3 Okular (20-Page PDF — Resize + Smooth Scroll from Page 1 + `pageStep` Jump)
+### 6.3 Okular (20-Page PDF — Resize + Smooth Scroll from Page 1 + `pageStep` Jump)
 | Policy | Resize p50 | Scroll p50 | Scroll p90 | Jump p50 | Peak RSS | Frames (CPU / GPU) | Switches | Avg GPU HW |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | `upstream` (`PHASE=0`) | `23.90 ms` | `7.21 ms` | `9.29 ms` | `6.60 ms` | `290.8 MB` | — | — | — |
@@ -214,7 +280,7 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 | `cpu-only` | `64.40 ms` | `31.98 ms` | `32.88 ms` | `33.93 ms` | `345.6 MB` | `118 / 0` | `0` | `0.00 ms` |
 | `gpu-only` | `2.34 ms` | `2.29 ms` | `9.91 ms` | `3.18 ms` | `455.3 MB` | `0 / 139` | `0` | `6.37 ms` |
 
-### 5.4 Adversarial 4-Phase Stress Suite (`bench_adversarial`)
+### 6.4 Adversarial 4-Phase Stress Suite (`bench_adversarial`)
 | Policy | Sparse Typing p50 | Dynamic Fallback p50 | Popup Churn p50 | Popups (CPU / GPU) | Main Frames (CPU / GPU) | Switches |
 |---|---:|---:|---:|---:|---:|---:|
 | `upstream` (`PHASE=0`) | `1.59 ms` | `13.08 ms` | `3.95 ms` | — | — | — |
@@ -226,7 +292,7 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 | `cpu-only` | `2.29 ms` | `27.83 ms` | `2.40 ms` | `7 / 0` | `146 / 0` | `0` |
 | `gpu-only` | `2.27 ms` | `13.1 ms` | `4.21 ms` | **`0 / 11`** *(allocates GPU rings)* | `3 / 137` | `1` |
 
-### 5.5 Post-Glyph Fast Path Runs (`1dd0c0ee`)
+### 6.5 Post-Glyph Fast Path Runs (`1dd0c0ee`)
 | Policy | Dolphin Resize (p50 / p90) | Dolphin `KeyNav` (p50 / p90) | Konsole Resize (p50 / p90) | `bench_adversarial` Popup Churn p50 |
 |---|---:|---:|---:|---:|
 | `upstream` (`PHASE=0`) | `29.01 / 36.19 ms` | `2.05 / 2.53 ms` | `27.56 / 34.70 ms` | `3.95 ms` |
@@ -236,7 +302,7 @@ Running the 36-run Policy Arena and testing widget-aware routing **falsified thr
 
 ---
 
-## 6. How QtPhase Compares to Existing Renderers & Cross-Platform Portability
+## 7. How QtPhase Compares to Existing Renderers & Cross-Platform Portability
 
 | Renderer | Architecture | Where QtPhase Wins | Where They Win |
 | :--- | :--- | :--- | :--- |
@@ -258,7 +324,7 @@ Only the ~250-line Wayland scanout ring (`QWaylandPhasedWindow`) is Linux-specif
 
 ---
 
-## 7. Verdict, Known Limitations & Open Research Questions
+## 8. Verdict, Known Limitations & Open Research Questions
 
 ### Current Verdict
 On an integrated AMD GPU today, **staying on Vulkan for main windows + routing transient `Qt::Popup`/`Qt::ToolTip` windows to CPU `wl_shm`** (`async-race`) is the strongest latency strategy. Once Vulkan is initialized (~200 µs for secondary windows via shared `VkDevice`), GPU beats CPU partial-tile even on small edits (`0.7–1.0 ms` vs `4.1 ms` on Dolphin `KeyNav`), so aggressive mid-window CPU↔GPU switching mostly adds `p90` tail spikes. `contextual-bandit` and `widget-aware` are close runners-up, and `cadence-power` is the cleanest laptop/power-saving hybrid (`Sw=1` on Konsole sparse typing).
@@ -277,7 +343,7 @@ This study is **not yet hardware-conclusive** and intentionally leaves concrete 
 
 ---
 
-## 8. Quickstart: Build, Demos & Reproducible Benchmarks
+## 9. Quickstart: Build, Demos & Reproducible Benchmarks
 
 ### Prerequisites (Linux Wayland)
 - CMake ≥ 3.22, Ninja, C++20 compiler
