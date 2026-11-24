@@ -44,6 +44,8 @@ public:
 
     Q_DISABLE_COPY_MOVE(QPhaseSurfacePresenter)
 
+    static bool isPlatformSupported();
+
     QPhaseSceneArena &arena() noexcept;
     const QPhaseSceneArena &arena() const noexcept;
 

@@ -65,7 +65,8 @@ public:
                       std::vector<PhaseGpuPrimitive> &outPrimitives,
                       std::vector<uint32_t> &outTransientTransforms,
                       std::vector<uint32_t> &outTransientClips,
-                      std::vector<uint32_t> &outOwnedImageSlots);
+                      std::vector<uint32_t> &outOwnedImageSlots,
+                      std::vector<QRectF> *outPrimLocalBounds = nullptr);
     ~QPhasePaintEngine() override = default;
 
     bool begin(QPaintDevice *pdev) override;
@@ -112,6 +113,7 @@ private:
     std::vector<uint32_t> &m_outTransientTransforms;
     std::vector<uint32_t> &m_outTransientClips;
     std::vector<uint32_t> &m_outOwnedImageSlots;
+    std::vector<QRectF> *m_outPrimLocalBounds = nullptr;
 
     QTransform m_transform;
     QPen m_pen{Qt::black};

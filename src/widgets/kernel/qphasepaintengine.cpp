@@ -316,7 +316,8 @@ QPhasePaintEngine::QPhasePaintEngine(QPhaseSceneArena &arena,
                                      std::vector<PhaseGpuPrimitive> &outPrimitives,
                                      std::vector<uint32_t> &outTransientTransforms,
                                      std::vector<uint32_t> &outTransientClips,
-                                     std::vector<uint32_t> &outOwnedImageSlots)
+                                     std::vector<uint32_t> &outOwnedImageSlots,
+                                     std::vector<QRectF> *outPrimLocalBounds)
     : QPaintEngine(PaintEngineFeatures(
             PrimitiveTransform
             | PixmapTransform
@@ -339,6 +340,7 @@ QPhasePaintEngine::QPhasePaintEngine(QPhaseSceneArena &arena,
     , m_outTransientTransforms(outTransientTransforms)
     , m_outTransientClips(outTransientClips)
     , m_outOwnedImageSlots(outOwnedImageSlots)
+    , m_outPrimLocalBounds(outPrimLocalBounds)
     , m_activeTransformSlot(baseTransformSlot)
     , m_activeClipSlots({baseClipSlot})
 {
@@ -484,10 +486,26 @@ void QPhasePaintEngine::pushPrimitiveClipped(const PhaseGpuPrimitive &prim)
 {
     std::vector<uint32_t> clips;
     ensureCurrentClipSlots(clips);
+    QRectF localBox;
+    if (m_outPrimLocalBounds) {
+        if (prim.kind == uint32_t(PhasePrimKind::StrokeSegment)) {
+            const qreal hw = std::max<qreal>(0.5, prim.p0 * 0.5) + 1.0;
+            localBox = QRectF(QPointF(prim.x, prim.y), QPointF(prim.w, prim.h))
+                    .normalized().adjusted(-hw, -hw, hw, hw);
+        } else {
+            localBox = QRectF(prim.x, prim.y, prim.w, prim.h).adjusted(-1.0, -1.0, 1.0, 1.0);
+        }
+        if (prim.transformIndex != m_baseTransformSlot && !m_transform.isIdentity())
+            localBox = m_transform.mapRect(localBox);
+        if (m_clipEnabled && !m_clipRegion.isEmpty())
+            localBox &= QRectF(m_clipRegion.boundingRect());
+    }
     for (uint32_t c : clips) {
         PhaseGpuPrimitive copy = prim;
         copy.clipIndex = c;
         m_outPrimitives.push_back(copy);
+        if (m_outPrimLocalBounds)
+            m_outPrimLocalBounds->push_back(localBox);
     }
 }
 

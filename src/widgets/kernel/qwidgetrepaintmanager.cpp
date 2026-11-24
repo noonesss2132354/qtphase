@@ -185,7 +185,7 @@ void QWidgetRepaintManager::markDirty(const T &r, QWidget *widget, UpdateTime up
         // to invalidate), so a parent container BufferInvalid during resize should not force fixed-size
         // children to repaint — syncWidgetRecursive() already repaints any child whose size() changed!
         Q_UNUSED(bufferState);
-        td->phaseBridge->markWidgetDirty(widget);
+        td->phaseBridge->markWidgetDirty(widget, QRegion(r));
         td->phaseBridge->scheduleUpdate(updateTime == UpdateNow);
         return;
     }

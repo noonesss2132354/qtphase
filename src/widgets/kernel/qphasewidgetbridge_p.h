@@ -18,6 +18,7 @@
 #include <QtWidgets/private/qtwidgetsglobal_p.h>
 #include "qphasepaintengine_p.h"
 #include <QtCore/qrect.h>
+#include <QtGui/qregion.h>
 
 #include <cstdint>
 #include <memory>
@@ -39,12 +40,16 @@ struct QWidgetPhaseNode {
     uint32_t parentTransformSlot = 0;
     uint32_t parentClipSlot = 0;
     std::vector<uint32_t> primitiveSlots;
+    std::vector<QRectF> primLocalBounds;
     std::vector<uint32_t> transientTransforms;
     std::vector<uint32_t> transientClips;
     std::vector<uint32_t> ownedImageSlots;
     uint64_t ownedImageEpoch = 0;
     QRect lastGeometry;
+    QRegion dirtyRegion;
     bool visualsDirty = true;
+    bool fullRepaintNeeded = true;
+    uint8_t partialPatchCount = 0;
 
     ~QWidgetPhaseNode();
     void detach();
@@ -61,7 +66,7 @@ public:
 
     Q_DISABLE_COPY_MOVE(QPhaseWidgetBridge)
 
-    void markWidgetDirty(QWidget *widget);
+    void markWidgetDirty(QWidget *widget, const QRegion &localRegion = QRegion());
     void markIntersectingDirty(const QRegion &tlwRegion);
     void markAllDirty();
 

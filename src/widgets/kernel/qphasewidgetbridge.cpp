@@ -34,6 +34,7 @@ void QWidgetPhaseNode::detach()
     for (uint32_t s : primitiveSlots)
         arena->freePrimitive(s);
     primitiveSlots.clear();
+    primLocalBounds.clear();
     for (uint32_t s : transientTransforms)
         arena->freeTransform(s);
     transientTransforms.clear();
@@ -52,7 +53,10 @@ void QWidgetPhaseNode::detach()
     parentClipSlot = 0;
     arena = nullptr;
     imageCache = nullptr;
+    dirtyRegion = QRegion();
     visualsDirty = true;
+    fullRepaintNeeded = true;
+    partialPatchCount = 0;
 }
 
 // ============================================================================
@@ -75,9 +79,7 @@ bool QPhaseWidgetBridge::isEnabledFor(const QWidget *topLevelWidget)
     if (!env.isEmpty() && env == "0")
         return false;
 
-    // Only activate on Wayland where QWaylandPhasedWindow provides zero-tear PhasedSurface
-    const QString platform = QGuiApplication::platformName();
-    return platform.startsWith(QLatin1String("wayland"));
+    return QPhaseSurfacePresenter::isPlatformSupported();
 }
 
 QPhaseWidgetBridge::QPhaseWidgetBridge(QWidget *topLevelWidget, QWindow *widgetWindow)
@@ -122,15 +124,22 @@ void QPhaseWidgetBridge::shutdown()
     m_presenter.reset();
 }
 
-void QPhaseWidgetBridge::markWidgetDirty(QWidget *widget)
+void QPhaseWidgetBridge::markWidgetDirty(QWidget *widget, const QRegion &localRegion)
 {
     if (!widget)
         return;
     QWidgetPrivate *wd = QWidgetPrivate::get(widget);
     if (!wd)
         return;
-    if (wd->phaseNode)
+    if (wd->phaseNode) {
         wd->phaseNode->visualsDirty = true;
+        if (localRegion.isEmpty()) {
+            wd->phaseNode->fullRepaintNeeded = true;
+            wd->phaseNode->dirtyRegion = QRegion();
+        } else if (!wd->phaseNode->fullRepaintNeeded) {
+            wd->phaseNode->dirtyRegion += localRegion;
+        }
+    }
 }
 
 void QPhaseWidgetBridge::markIntersectingDirty(const QRegion &tlwRegion)
@@ -145,8 +154,11 @@ void QPhaseWidgetBridge::markIntersectingDirty(const QRegion &tlwRegion)
         if (!wRect.intersects(dirtyBounds))
             return;
         QWidgetPrivate *wd = QWidgetPrivate::get(w);
-        if (wd->phaseNode)
+        if (wd->phaseNode) {
             wd->phaseNode->visualsDirty = true;
+            wd->phaseNode->fullRepaintNeeded = true;
+            wd->phaseNode->dirtyRegion = QRegion();
+        }
         for (QObject *obj : wd->children) {
             if (auto *ch = qobject_cast<QWidget *>(obj)) {
                 if (!ch->isWindow() && !ch->isHidden())
@@ -274,6 +286,8 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
                                            QRectF(0.0, 0.0, std::max(0, geom.width()), std::max(0, geom.height())),
                                            QPhaseCorners{});
         node.visualsDirty = true;
+        node.fullRepaintNeeded = true;
+        node.dirtyRegion = QRegion();
         drawOrderChanged = true;
     }
 
@@ -285,13 +299,22 @@ void QPhaseWidgetBridge::syncWidgetRecursive(QWidget *w,
                          QRectF(0.0, 0.0, std::max(0, geom.width()), std::max(0, geom.height())),
                          QPhaseCorners{});
         node.lastGeometry = geom;
-        if (sizeChanged)
+        if (sizeChanged) {
             node.visualsDirty = true;
+            node.fullRepaintNeeded = true;
+            node.dirtyRegion = QRegion();
+        }
     }
 
     if (m_allDirty || node.visualsDirty) {
+        if (m_allDirty) {
+            node.fullRepaintNeeded = true;
+            node.dirtyRegion = QRegion();
+        }
         paintSingleWidget(w, node, arena);
         node.visualsDirty = false;
+        node.fullRepaintNeeded = false;
+        node.dirtyRegion = QRegion();
         drawOrderChanged = true;
     }
 
@@ -315,15 +338,13 @@ void QPhaseWidgetBridge::paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, Q
     if (!wd)
         return;
 
-    // Release previous transient transforms & clips emitted by this widget's last paintEvent
-    for (uint32_t s : node.transientTransforms)
-        arena.freeTransform(s);
-    node.transientTransforms.clear();
-    for (uint32_t s : node.transientClips)
-        arena.freeClip(s);
-    node.transientClips.clear();
-
     if (w->width() <= 0 || w->height() <= 0) {
+        for (uint32_t s : node.transientTransforms)
+            arena.freeTransform(s);
+        node.transientTransforms.clear();
+        for (uint32_t s : node.transientClips)
+            arena.freeClip(s);
+        node.transientClips.clear();
         if (!node.ownedImageSlots.empty()) {
             m_imageCache.releaseImageSlots(arena, node.ownedImageEpoch, node.ownedImageSlots);
             node.ownedImageSlots.clear();
@@ -331,11 +352,178 @@ void QPhaseWidgetBridge::paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, Q
         for (uint32_t s : node.primitiveSlots)
             arena.freePrimitive(s);
         node.primitiveSlots.clear();
+        node.primLocalBounds.clear();
+        node.partialPatchCount = 0;
         return;
     }
 
+    const QRect wRect = w->rect();
+    const qint64 wArea = qint64(wRect.width()) * qint64(wRect.height());
+    const qreal dpr = m_window ? m_window->devicePixelRatio() : 1.0;
+    const bool asRoot = (w == m_tlw);
+
+    // Fast Sub-Rect Partial Patch Path for large viewports (e.g. Dolphin KItemListView, QTreeView, QTextEdit):
+    // When only a small sub-rect changed (like moving row selection or blinking cursor), clip the new patch
+    // to the dirty rect and splice only the changed primitives in place.
+    // Safety guarantee: if the patch paints an opaque background covering `expanded` (e.g. QAbstractScrollArea
+    // viewports, QTreeView, KItemListView), any straddling old primitives (like vertical branch lines or column
+    // dividers) are cleanly overdrawn inside `expanded` and untouched outside. If the widget is transparent
+    // (no opaque cover), we only accept the patch when zero non-background primitives straddle `expanded`.
+    if (!node.fullRepaintNeeded
+        && !node.dirtyRegion.isEmpty()
+        && !node.primitiveSlots.empty()
+        && node.primLocalBounds.size() == node.primitiveSlots.size()
+        && node.partialPatchCount < 16
+        && wRect.width() >= 256 && wRect.height() >= 128) {
+        const QRect expanded = node.dirtyRegion.boundingRect() & wRect;
+        if (!expanded.isEmpty()
+            && qint64(expanded.width()) * qint64(expanded.height()) * 100 < wArea * 35) {
+            const uint32_t patchClipSlot = arena.allocateClip(
+                    node.clipSlot, node.transformSlot, QRectF(expanded), QPhaseCorners{});
+            const size_t prevTransTxCount = node.transientTransforms.size();
+            const size_t prevTransClipCount = node.transientClips.size();
+            const size_t prevOwnedImgCount = node.ownedImageSlots.size();
+            node.transientClips.push_back(patchClipSlot);
+
+            std::vector<PhaseGpuPrimitive> recorded;
+            std::vector<QRectF> recordedBounds;
+            recorded.reserve(32);
+            recordedBounds.reserve(32);
+
+            QPhasePaintEngine engine(arena, m_imageCache,
+                                     node.transformSlot, patchClipSlot, dpr,
+                                     recorded, node.transientTransforms, node.transientClips,
+                                     node.ownedImageSlots, &recordedBounds);
+            QPhasePaintDevice pdev(w, &engine);
+            const QRegion patchRgn(expanded);
+
+            w->setAttribute(Qt::WA_WState_InPaintEvent, true);
+            wd->setRedirected(&pdev, QPoint(0, 0));
+
+            QWidget *redirectedParent = nullptr;
+            if (QWidget *p = w->parentWidget(); p && p != m_tlw
+                && w->objectName() == QLatin1StringView("qt_scrollarea_viewport")
+                && !p->testAttribute(Qt::WA_WState_InPaintEvent)) {
+                redirectedParent = p;
+                p->setAttribute(Qt::WA_WState_InPaintEvent, true);
+                QWidgetPrivate::get(p)->setRedirected(&pdev, w->pos());
+            }
+
+            if ((asRoot || w->autoFillBackground() || w->testAttribute(Qt::WA_StyledBackground))
+                && !w->testAttribute(Qt::WA_OpaquePaintEvent)
+                && !w->testAttribute(Qt::WA_NoSystemBackground)) {
+                QPainter bgPainter(w);
+                if (bgPainter.isActive()) {
+                    wd->paintBackground(&bgPainter, patchRgn,
+                                        asRoot ? QWidgetPrivate::DrawAsRoot : QWidgetPrivate::DrawWidgetFlags());
+                }
+            }
+
+            wd->sendPaintEvent(patchRgn);
+
+            if (redirectedParent) {
+                QWidgetPrivate::get(redirectedParent)->restoreRedirected();
+                redirectedParent->setAttribute(Qt::WA_WState_InPaintEvent, false);
+            }
+            wd->restoreRedirected();
+            w->setAttribute(Qt::WA_WState_InPaintEvent, false);
+
+            // Check whether the recorded patch opaquely covers `expanded`
+            QRegion opaqueCovered;
+            for (const PhaseGpuPrimitive &p : recorded) {
+                const bool isOpaqueSolid = (p.kind == uint32_t(PhasePrimKind::SolidRect)
+                                            || (p.kind == uint32_t(PhasePrimKind::RoundedBox)
+                                                && p.rTL == 0.0f && p.rTR == 0.0f
+                                                && p.rBR == 0.0f && p.rBL == 0.0f))
+                        && p.transformIndex == node.transformSlot
+                        && p.clipIndex == patchClipSlot
+                        && p.c0a >= 0.999f
+                        && (p.resourceIndex == 0u || p.c1a >= 0.999f);
+                if (isOpaqueSolid) {
+                    const QRect r = QRectF(p.x, p.y, p.w, p.h).toRect() & expanded;
+                    if (!r.isEmpty()) {
+                        opaqueCovered += r;
+                        if ((patchRgn - opaqueCovered).isEmpty())
+                            break;
+                    }
+                }
+            }
+            const bool hasOpaqueCover = (patchRgn - opaqueCovered).isEmpty();
+
+            const QRectF expF(expanded);
+            const QRectF containmentBox = expF.adjusted(-2.0, -2.0, 2.0, 2.0);
+            auto isFullBgPrim = [wArea](const QRectF &b) noexcept {
+                return (b.width() * b.height()) >= double(wArea) * 0.5;
+            };
+
+            bool canSplice = hasOpaqueCover;
+            if (!canSplice) {
+                canSplice = true;
+                for (const QRectF &b : node.primLocalBounds) {
+                    if (isFullBgPrim(b))
+                        continue;
+                    if (b.intersects(expF) && !containmentBox.contains(b)) {
+                        canSplice = false;
+                        break;
+                    }
+                }
+            }
+
+            if (canSplice) {
+                // Free every old non-background primitive contained inside `expanded`
+                size_t writeIdx = 0;
+                for (size_t i = 0; i < node.primitiveSlots.size(); ++i) {
+                    const QRectF &b = node.primLocalBounds[i];
+                    if (!isFullBgPrim(b) && containmentBox.contains(b)) {
+                        arena.freePrimitive(node.primitiveSlots[i]);
+                    } else {
+                        if (writeIdx != i) {
+                            node.primitiveSlots[writeIdx] = node.primitiveSlots[i];
+                            node.primLocalBounds[writeIdx] = node.primLocalBounds[i];
+                        }
+                        ++writeIdx;
+                    }
+                }
+                node.primitiveSlots.resize(writeIdx);
+                node.primLocalBounds.resize(writeIdx);
+
+                for (size_t i = 0; i < recorded.size(); ++i) {
+                    node.primitiveSlots.push_back(arena.allocatePrimitive(recorded[i]));
+                    node.primLocalBounds.push_back(recordedBounds[i] & expF);
+                }
+                ++node.partialPatchCount;
+                return;
+            }
+
+            // Transparent widget with straddling primitives: roll back transient allocations & do clean full repaint
+            for (size_t i = prevTransTxCount; i < node.transientTransforms.size(); ++i)
+                arena.freeTransform(node.transientTransforms[i]);
+            node.transientTransforms.resize(prevTransTxCount);
+            for (size_t i = prevTransClipCount; i < node.transientClips.size(); ++i)
+                arena.freeClip(node.transientClips[i]);
+            node.transientClips.resize(prevTransClipCount);
+            if (node.ownedImageSlots.size() > prevOwnedImgCount) {
+                std::vector<uint32_t> extraImgs(node.ownedImageSlots.begin() + ptrdiff_t(prevOwnedImgCount),
+                                                node.ownedImageSlots.end());
+                node.ownedImageSlots.resize(prevOwnedImgCount);
+                m_imageCache.releaseImageSlots(arena, node.ownedImageEpoch, extraImgs);
+            }
+        }
+    }
+
+    // Full widget repaint path (resizes, first paint, small widgets, or periodic compaction)
+    node.partialPatchCount = 0;
+    for (uint32_t s : node.transientTransforms)
+        arena.freeTransform(s);
+    node.transientTransforms.clear();
+    for (uint32_t s : node.transientClips)
+        arena.freeClip(s);
+    node.transientClips.clear();
+
     std::vector<PhaseGpuPrimitive> recorded;
+    std::vector<QRectF> recordedBounds;
     recorded.reserve(std::max<size_t>(node.primitiveSlots.size(), 8));
+    recordedBounds.reserve(std::max<size_t>(node.primitiveSlots.size(), 8));
 
     // Record into new ownedImageSlots first so unchanged textures stay ref-counted & hot in VRAM,
     // then immediately release stale resize-width pixmaps/fallbacks from the previous paint!
@@ -344,15 +532,12 @@ void QPhaseWidgetBridge::paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, Q
     node.ownedImageSlots.clear();
     node.ownedImageEpoch = m_imageCache.epoch;
 
-    const qreal dpr = m_window ? m_window->devicePixelRatio() : 1.0;
     QPhasePaintEngine engine(arena, m_imageCache,
                              node.transformSlot, node.clipSlot, dpr,
                              recorded, node.transientTransforms, node.transientClips,
-                             node.ownedImageSlots);
+                             node.ownedImageSlots, &recordedBounds);
     QPhasePaintDevice pdev(w, &engine);
-
-    const bool asRoot = (w == m_tlw);
-    const QRegion fullRgn(w->rect());
+    const QRegion fullRgn(wRect);
 
     w->setAttribute(Qt::WA_WState_InPaintEvent, true);
     wd->setRedirected(&pdev, QPoint(0, 0));
@@ -407,6 +592,7 @@ void QPhaseWidgetBridge::paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, Q
         else
             node.primitiveSlots.push_back(arena.allocatePrimitive(recorded[i]));
     }
+    node.primLocalBounds = std::move(recordedBounds);
 }
 
 QT_END_NAMESPACE

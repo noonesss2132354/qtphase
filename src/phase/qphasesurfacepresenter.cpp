@@ -10,6 +10,7 @@
 #include <QtCore/qelapsedtimer.h>
 #include <QtCore/qmetaobject.h>
 #include <QtCore/qtimer.h>
+#include <QtGui/qguiapplication.h>
 #include <QtGui/qscreen.h>
 #include <QtGui/qwindow.h>
 
@@ -173,6 +174,12 @@ public:
     quint64 totalSyncedBytes = 0;
     bool dumpedDebugPng = false;
 };
+
+bool QPhaseSurfacePresenter::isPlatformSupported()
+{
+    const QString platform = QGuiApplication::platformName();
+    return platform.startsWith(QLatin1String("wayland"));
+}
 
 QPhaseSurfacePresenter::QPhaseSurfacePresenter(QWindow *window, QObject *parent)
     : QObject(parent)
@@ -478,9 +485,12 @@ bool QPhaseSurfacePresenter::presentGpuFrame(QPlatformWindow *pw,
     if (!d->dumpedDebugPng) {
         const QByteArray dumpPath = qgetenv("QT_WIDGETS_PHASE_DUMP_PNG");
         if (!dumpPath.isEmpty()) {
-            d->dumpedDebugPng = true;
-            const QImage img = d->vulkanBackend->renderOffscreenToImage(d->uiArena, pxSize, dpr, frameTimeNs);
-            img.save(QString::fromUtf8(dumpPath));
+            const quint64 targetFrame = std::max<quint64>(1, qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_DUMP_FRAME"));
+            if (d->gpuFrames + 1 >= targetFrame) {
+                d->dumpedDebugPng = true;
+                const QImage img = d->vulkanBackend->renderOffscreenToImage(d->uiArena, pxSize, dpr, frameTimeNs);
+                img.save(QString::fromUtf8(dumpPath));
+            }
         }
     }
 
@@ -686,16 +696,19 @@ void QPhaseSurfacePresenter::presentNow()
 
     // Phase::WorkerRace — Cold-start temporal handoff (once per process!):
     // 1. While the single background thread is still warming up Vulkan 1.3, render Frame 1+ instantly on CPU wl_shm.
-    // 2. Once Vulkan 1.3 is warm (WarmReady), present ONE real DMA-BUF frame with waitForGpuCompletion=true,
-    //    read its true VkQueryPool hardware duration, and lock the process-wide winner with zero wasted work!
+    // 2. Once Vulkan 1.3 is warm (WarmReady):
+    //    - On real hardware GPUs: present Frame 1 asynchronously (waitForGpuCompletion=false, 0 ms fence stall!)
+    //      and lock GpuSteadyState immediately so cold startup matches upstream Qt Widgets!
+    //    - On software Vulkan (e.g. llvmpipe): probe ONE real frame with waitForGpuCompletion=true and
+    //      lock whichever backend is genuinely faster.
     if (coord.currentState() == ProcessGpuState::WarmReady) {
+        const bool backendOk = ensureVulkanBackendReady();
+        const bool hwGpu = backendOk && d->vulkanBackend && d->vulkanBackend->isHardwareGpu();
         qint64 probeHwUs = 0;
-        const bool okGpu = presentGpuFrame(pw, pxSize, finalLogicalSize, dpr, hasAlpha, frameTimeNs, true, &probeHwUs);
-        const bool hwGpu = d->vulkanBackend && d->vulkanBackend->isHardwareGpu();
+        const bool okGpu = backendOk && presentGpuFrame(
+                pw, pxSize, finalLogicalSize, dpr, hasAlpha, frameTimeNs, !hwGpu, &probeHwUs);
         const qint64 cpuRefUs = (d->lastCpuBootUs > 0) ? d->lastCpuBootUs : 4000;
-        const bool gpuWins = okGpu && (hwGpu
-                ? (probeHwUs <= std::max<qint64>(kHardwareGpuFastUs, cpuRefUs * 2))
-                : (probeHwUs > 0 && probeHwUs < cpuRefUs));
+        const bool gpuWins = okGpu && (hwGpu || (probeHwUs > 0 && probeHwUs < cpuRefUs));
 
         if (gpuWins) {
             coord.lockWinner(ProcessGpuState::GpuLocked);
@@ -704,10 +717,11 @@ void QPhaseSurfacePresenter::presentNow()
             d->lastDispatchedDpr = dpr;
             finalizeWinner(Phase::GpuSteadyState);
             if (sProfile) {
-                std::fprintf(stderr, "[PhaseProfile UI] seq=%llu px=%dx%d sync=%.2fms prims=%zu imgs=%zu (probe->GPU hw=%.2fms vs cpu=%.2fms)\n",
+                std::fprintf(stderr, "[PhaseProfile UI] seq=%llu px=%dx%d sync=%.2fms prims=%zu imgs=%zu (%s->GPU hw=%.2fms vs cpu=%.2fms)\n",
                              static_cast<unsigned long long>(++d->nextFrameSeq),
                              pxSize.width(), pxSize.height(), double(syncUs) / 1000.0,
                              d->uiArena.drawOrder().size(), d->uiArena.activeImageSlotCount(),
+                             hwGpu ? "hw-async" : "probe",
                              double(probeHwUs) / 1000.0, double(cpuRefUs) / 1000.0);
             }
         } else {
