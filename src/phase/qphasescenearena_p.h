@@ -39,6 +39,7 @@ QT_BEGIN_NAMESPACE
 
 class QPhaseView;
 class QPhaseCpuRasterizer;
+class QFontEngine;
 
 enum class PhasePrimKind : uint32_t {
     SolidRect     = 0,
@@ -283,6 +284,13 @@ public:
                                   uint64_t frameTimeNs);
 
     // Stage 4: Retained hb-gpu / hb-raster glyphs, COLRv0 layers, CBDT/COLRv1 color bitmaps & SVG vectors
+    struct PhaseFontFaceHandle {
+        hb_face_t *hbFace = nullptr;
+        bool hasColorLayers = false;
+        bool hasBitmapColor = false;
+    };
+    PhaseFontFaceHandle resolveFontFace(QFontEngine *fe);
+    uint32_t registerOrGetGlyphForFace(hb_face_t *hbFace, uint32_t glyphId);
     uint32_t registerOrGetGlyph(const QRawFont &rawFont, uint32_t glyphId);
     bool tryGetColorGlyphLayers(const QRawFont &rawFont, uint32_t glyphId, std::vector<PhaseColorGlyphLayer> &outLayers);
     PhaseBitmapGlyphEntry tryRegisterBitmapColorGlyph(const QRawFont &rawFont, uint32_t glyphId);
@@ -350,6 +358,7 @@ private:
     std::vector<uint64_t> m_curveTexels;
     std::vector<PhaseCurveEntry> m_curves;
     QHash<hb_face_t *, hb_font_t *> m_unscaledHbFonts;
+    QHash<hb_face_t *, uint8_t> m_faceColorFlags;
     QHash<uint64_t, uint32_t> m_glyphCurveMap;
     QHash<uint64_t, PhaseBitmapGlyphEntry> m_bitmapGlyphMap;
     QHash<QString, uint32_t> m_svgCurveMap;

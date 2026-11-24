@@ -163,6 +163,8 @@ public:
     bool needReleaseBootResources = false;
     bool swapchainFallbackAttached = false;
     float reportedDirtyAreaRatio = 1.0f;
+    uint32_t reportedSurfaceHints = QPhaseHintNone;
+    uint32_t reportedDirtyHints = QPhaseHintNone;
 
     struct CpuBootBufferState {
         void *handle = nullptr;
@@ -354,6 +356,12 @@ const char *QPhaseSurfacePresenter::renderPolicyName() const noexcept
 void QPhaseSurfacePresenter::reportDirtyAreaRatio(float ratio) noexcept
 {
     d->reportedDirtyAreaRatio = std::clamp(ratio, 0.0f, 1.0f);
+}
+
+void QPhaseSurfacePresenter::reportFrameHints(uint32_t surfaceHints, uint32_t dirtyHints) noexcept
+{
+    d->reportedSurfaceHints = surfaceHints;
+    d->reportedDirtyHints = dirtyHints;
 }
 
 void QPhaseSurfacePresenter::setForcedAffinity(QPhaseRendererAffinity affinity, bool blocking)
@@ -747,6 +755,7 @@ void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
     d->reflexTimer.stop();
     d->presentDirty = false;
     d->reportedDirtyAreaRatio = 1.0f;
+    d->reportedDirtyHints = QPhaseHintNone;
 
     static const bool sProfile = qEnvironmentVariableIntValue("QT_WIDGETS_PHASE_PROFILE") > 0;
     QElapsedTimer syncTimer;
@@ -777,6 +786,9 @@ void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
     caps.forcedBlocking = d->forcedBlocking;
     caps.hasCpuOnlyViews = (reqs.cpuOnlyViewCount > 0);
     caps.hasGpuOnlyViews = (reqs.gpuOnlyViewCount > 0);
+    caps.surfaceHints = d->reportedSurfaceHints;
+    if (d->window && d->window->type() == Qt::Dialog)
+        caps.surfaceHints |= QPhaseHintDialogWindow;
 
     const qint64 nowUs = d->createTimer.nsecsElapsed() / 1000;
     const quint64 pendingUploads = d->uiArena.pendingGpuUploadBytes();
@@ -794,6 +806,7 @@ void QPhaseSurfacePresenter::presentFrameInternal(bool isResize)
     freq.dirtyAreaRatio = (isResize || sizeChanged || !d->hasPresentedFrame) ? 1.0f : d->reportedDirtyAreaRatio;
     freq.frameIndex = d->cpuFrames + d->gpuFrames;
     freq.msSinceLastFrame = d->lastFrameTimeUs > 0 ? std::max<qint64>(0, (nowUs - d->lastFrameTimeUs) / 1000) : 0;
+    freq.dirtyHints = d->reportedDirtyHints;
     d->lastFrameTimeUs = nowUs;
 
     if (!d->policy)

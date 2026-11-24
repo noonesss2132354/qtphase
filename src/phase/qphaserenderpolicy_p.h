@@ -32,6 +32,18 @@ enum class QPhaseBackendTarget : quint8 {
     Gpu = 1,
 };
 
+// Toolkit-agnostic semantic widget hints (bitmask) passed from upper UI layers
+// (e.g. QPhaseWidgetBridge) to QPhaseRenderPolicy without leaking QtWidgets into QtPhase.
+enum QPhaseSurfaceHint : uint32_t {
+    QPhaseHintNone                = 0u,
+    QPhaseHintDialogWindow        = 1u << 0, // QDialog / QMessageBox / settings dialog
+    QPhaseHintTextInputDirty      = 1u << 1, // QLineEdit / QSpinBox / QTextEdit localized edit or cursor
+    QPhaseHintControlChromeDirty  = 1u << 2, // Buttons, tabs, status bar, progress bar, scrollbars
+    QPhaseHintScrollViewportDirty = 1u << 3, // QAbstractScrollArea viewport (lists, trees, PDF, terminal)
+    QPhaseHintHeavyCanvasDirty    = 1u << 4, // Per-widget cached CPU raster or heavy fallback canvas
+    QPhaseHintComplexPaintWidget  = 1u << 5, // CompositionMode / curved clipPath / QGraphicsEffect present
+};
+
 struct QPhaseSurfaceCaps {
     bool isPopupOrTooltip = false;
     bool vulkanWarmReady = false;
@@ -41,6 +53,7 @@ struct QPhaseSurfaceCaps {
     bool forcedBlocking = false;
     bool hasCpuOnlyViews = false;
     bool hasGpuOnlyViews = false;
+    uint32_t surfaceHints = QPhaseHintNone;
 };
 
 struct QPhaseFrameRequest {
@@ -56,6 +69,7 @@ struct QPhaseFrameRequest {
     float dirtyAreaRatio = 1.0f; // 0.0..1.0 fraction of surface area modified this frame
     quint64 frameIndex = 0;
     qint64 msSinceLastFrame = 0;
+    uint32_t dirtyHints = QPhaseHintNone;
 };
 
 struct QPhaseFrameOutcome {

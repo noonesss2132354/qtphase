@@ -18,6 +18,7 @@
 #include <QtWidgets/private/qtwidgetsglobal_p.h>
 #include "qphasepaintengine_p.h"
 #include <QtCore/qrect.h>
+#include <QtGui/qimage.h>
 #include <QtGui/qregion.h>
 
 #include <cstdint>
@@ -33,6 +34,11 @@ class QPhaseSurfacePresenter;
 
 // Retained per-QWidget scene arena slots (owned by QWidgetPrivate)
 struct QWidgetPhaseNode {
+    enum class WidgetRenderMode : uint8_t {
+        NativePhase = 0,     // Native QPhasePaintEngine -> Vulkan 1.3 vector/SDF/glyph primitives
+        CachedCpuRaster = 1, // Direct QRasterPaintEngine -> cached BGRA QImage -> 1 Vulkan quad
+    };
+
     QPhaseSceneArena *arena = nullptr;
     QPhaseWidgetImageCache *imageCache = nullptr;
     uint32_t transformSlot = 0;
@@ -50,6 +56,13 @@ struct QWidgetPhaseNode {
     bool visualsDirty = true;
     bool fullRepaintNeeded = true;
     uint8_t partialPatchCount = 0;
+
+    // Level 2 Per-Widget Hybrid state
+    WidgetRenderMode renderMode = WidgetRenderMode::NativePhase;
+    bool forcedCpuForCorrectness = false;
+    uint8_t heavyNativeStreak = 0;
+    QImage cachedRasterSurface;
+    qreal cachedRasterDpr = 0.0;
 
     ~QWidgetPhaseNode();
     void detach();
@@ -86,8 +99,10 @@ private:
                              uint32_t parentClipSlot,
                              std::vector<uint32_t> &outDrawOrder,
                              bool &drawOrderChanged,
-                             qint64 &outDirtyArea);
+                             qint64 &outDirtyArea,
+                             uint32_t &outDirtyHints);
     void paintSingleWidget(QWidget *w, QWidgetPhaseNode &node, QPhaseSceneArena &arena);
+    void paintSingleWidgetCachedCpu(QWidget *w, QWidgetPhaseNode &node, QPhaseSceneArena &arena, bool forceFull);
 
     QWidget *m_tlw = nullptr;
     QWindow *m_window = nullptr;

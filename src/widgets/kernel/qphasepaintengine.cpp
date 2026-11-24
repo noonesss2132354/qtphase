@@ -317,7 +317,8 @@ QPhasePaintEngine::QPhasePaintEngine(QPhaseSceneArena &arena,
                                      std::vector<uint32_t> &outTransientTransforms,
                                      std::vector<uint32_t> &outTransientClips,
                                      std::vector<uint32_t> &outOwnedImageSlots,
-                                     std::vector<QRectF> *outPrimLocalBounds)
+                                     std::vector<QRectF> *outPrimLocalBounds,
+                                     QPhaseWidgetPaintStats *outStats)
     : QPaintEngine(PaintEngineFeatures(
             PrimitiveTransform
             | PixmapTransform
@@ -341,6 +342,7 @@ QPhasePaintEngine::QPhasePaintEngine(QPhaseSceneArena &arena,
     , m_outTransientClips(outTransientClips)
     , m_outOwnedImageSlots(outOwnedImageSlots)
     , m_outPrimLocalBounds(outPrimLocalBounds)
+    , m_outStats(outStats)
     , m_activeTransformSlot(baseTransformSlot)
     , m_activeClipSlots({baseClipSlot})
 {
@@ -387,8 +389,11 @@ void QPhasePaintEngine::updateState(const QPaintEngineState &s)
         m_pen = s.pen();
     if (flags & DirtyBrush)
         m_brush = s.brush();
-    if (flags & DirtyCompositionMode)
+    if (flags & DirtyCompositionMode) {
         m_compMode = s.compositionMode();
+        if (m_outStats && m_compMode != QPainter::CompositionMode_SourceOver)
+            m_outStats->usedUnsupportedCompMode = true;
+    }
     if (flags & DirtyHints)
         m_antialiasing = s.renderHints().testFlag(QPainter::Antialiasing);
 
@@ -405,6 +410,17 @@ void QPhasePaintEngine::updateState(const QPaintEngineState &s)
             m_clipEnabled = true;
             if (flags & DirtyClipPath) {
                 const QPainterPath mapped = m_transform.map(s.clipPath());
+                if (m_outStats && !mapped.isEmpty()) {
+                    bool hasCurves = false;
+                    for (int ei = 0; ei < mapped.elementCount(); ++ei) {
+                        if (mapped.elementAt(ei).type == QPainterPath::CurveToElement) {
+                            hasCurves = true;
+                            break;
+                        }
+                    }
+                    if (hasCurves || mapped.elementCount() > 6)
+                        m_outStats->usedComplexClipPath = true;
+                }
                 const QRegion rgn(mapped.boundingRect().toAlignedRect());
                 if (op == Qt::ReplaceClip || !wasClipEnabled)
                     m_clipRegion = rgn;
@@ -460,7 +476,7 @@ uint32_t QPhasePaintEngine::ensureCurrentTransformSlot()
     return slot;
 }
 
-void QPhasePaintEngine::ensureCurrentClipSlots(std::vector<uint32_t> &outClipSlots)
+const std::vector<uint32_t> &QPhasePaintEngine::ensureCurrentClipSlots()
 {
     if (!m_clipSlotValid) {
         m_activeClipSlots.clear();
@@ -479,13 +495,14 @@ void QPhasePaintEngine::ensureCurrentClipSlots(std::vector<uint32_t> &outClipSlo
         }
         m_clipSlotValid = true;
     }
-    outClipSlots = m_activeClipSlots;
+    return m_activeClipSlots;
 }
 
 void QPhasePaintEngine::pushPrimitiveClipped(const PhaseGpuPrimitive &prim)
 {
-    std::vector<uint32_t> clips;
-    ensureCurrentClipSlots(clips);
+    const std::vector<uint32_t> &clips = ensureCurrentClipSlots();
+    if (clips.empty())
+        return;
     QRectF localBox;
     if (m_outPrimLocalBounds) {
         if (prim.kind == uint32_t(PhasePrimKind::StrokeSegment)) {
@@ -549,6 +566,10 @@ void QPhasePaintEngine::emitRasterFallback(const QRectF &localBounds,
 
     uint32_t slot = m_imageCache.acquireHashedRaster(m_arena, h, QImage());
     if (slot == UINT32_MAX) {
+        if (m_outStats) {
+            ++m_outStats->fallbackCount;
+            m_outStats->fallbackPixels += uint64_t(pxW) * uint64_t(pxH);
+        }
         QImage img(pxW, pxH, QImage::Format_RGBA8888_Premultiplied);
         img.fill(Qt::transparent);
         {
@@ -1132,9 +1153,8 @@ void QPhasePaintEngine::drawTextItem(const QPointF &p, const QTextItem &textItem
     if (color.alpha() == 0)
         return;
 
-    QRawFont rawFont;
-    QRawFontPrivate::get(rawFont)->setFontEngine(ti.fontEngine);
-    if (!rawFont.isValid())
+    const QPhaseSceneArena::PhaseFontFaceHandle face = m_arena.resolveFontFace(ti.fontEngine);
+    if (!face.hbFace)
         return;
 
     // Reuse QFontEngine::getGlyphPositions() directly so RightToLeft (Arabic/Hebrew),
@@ -1144,21 +1164,6 @@ void QPhasePaintEngine::drawTextItem(const QPointF &p, const QTextItem &textItem
     ti.fontEngine->getGlyphPositions(ti.glyphs, QTransform(), ti.flags, outGlyphs, outPositions);
     if (outGlyphs.isEmpty())
         return;
-
-    const int n = outGlyphs.size();
-    QList<quint32> glyphIndexes;
-    QList<QPointF> positions;
-    glyphIndexes.reserve(n);
-    positions.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        glyphIndexes.append(outGlyphs[i]);
-        positions.append(outPositions[i].toPointF());
-    }
-
-    QGlyphRun run;
-    run.setRawFont(rawFont);
-    run.setGlyphIndexes(glyphIndexes);
-    run.setPositions(positions);
 
     uint32_t txSlot = ensureCurrentTransformSlot();
     if (ti.fontEngine->synthesized() & QFontEngine::SynthesizedItalic) {
@@ -1174,6 +1179,137 @@ void QPhasePaintEngine::drawTextItem(const QPointF &p, const QTextItem &textItem
         txSlot = slantSlot;
     }
 
+    const int n = outGlyphs.size();
+    const float cr = float(color.redF());
+    const float cg = float(color.greenF());
+    const float cb = float(color.blueF());
+    const float ca = float(color.alphaF());
+    const float pixelSize = float(ti.fontEngine->fontDef.pixelSize);
+
+    // Zero-allocation fast path for standard monochrome outline fonts (99.9% of UI/code/terminal text):
+    // skips QRawFont, QList<quint32>, QList<QPointF>, QGlyphRun, QPhaseVisuals, and color table checks!
+    if (!face.hasColorLayers && !face.hasBitmapColor && pixelSize > 0.0f) {
+        const std::vector<uint32_t> &clips = ensureCurrentClipSlots();
+        if (clips.empty())
+            return;
+
+        const bool singleClip = (clips.size() == 1);
+        const uint32_t firstClip = clips[0];
+        const bool needBounds = (m_outPrimLocalBounds != nullptr);
+        const bool needTxMap = needBounds && (txSlot != m_baseTransformSlot) && !m_transform.isIdentity();
+        const QRectF clipRectF = (needBounds && m_clipEnabled && !m_clipRegion.isEmpty())
+                ? QRectF(m_clipRegion.boundingRect()) : QRectF();
+        const bool clampClipBounds = !clipRectF.isNull();
+
+        m_outPrimitives.reserve(m_outPrimitives.size() + size_t(n) * clips.size());
+        if (needBounds)
+            m_outPrimLocalBounds->reserve(m_outPrimLocalBounds->size() + size_t(n) * clips.size());
+
+        const float pxBase = float(p.x());
+        const float pyBase = float(p.y());
+        const auto &curves = m_arena.curves();
+        const size_t startPrims = m_outPrimitives.size();
+
+        for (int i = 0; i < n; ++i) {
+            const uint32_t curveId = m_arena.registerOrGetGlyphForFace(face.hbFace, outGlyphs[i]);
+            if (curveId == 0u)
+                continue;
+            const PhaseCurveEntry &ce = curves[curveId];
+            const float scale = pixelSize / ce.unitsPerEm;
+            const float quadW = (ce.xMax - ce.xMin) * scale;
+            const float quadH = (ce.yMax - ce.yMin) * scale;
+            if (quadW <= 0.0f || quadH <= 0.0f)
+                continue;
+
+            const float baseX = pxBase + float(outPositions[i].x.toReal());
+            const float baseY = pyBase + float(outPositions[i].y.toReal());
+
+            PhaseGpuPrimitive prim{};
+            prim.kind = uint32_t(PhasePrimKind::HbGpuCurve);
+            prim.transformIndex = txSlot;
+            prim.clipIndex = firstClip;
+            prim.resourceIndex = ce.texelOffset;
+            prim.x = baseX + ce.xMin * scale;
+            prim.y = baseY - ce.yMax * scale;
+            prim.w = quadW;
+            prim.h = quadH;
+            prim.c0r = cr;
+            prim.c0g = cg;
+            prim.c0b = cb;
+            prim.c0a = ca;
+            prim.p0 = ce.xMin;
+            prim.p1 = ce.yMin;
+            prim.p2 = ce.xMax;
+            prim.p3 = ce.yMax;
+            prim.p4 = ce.unitsPerEm;
+            prim.p5 = float(curveId);
+
+            if (singleClip) {
+                m_outPrimitives.push_back(prim);
+                if (needBounds) {
+                    QRectF lb(prim.x - 1.0, prim.y - 1.0, prim.w + 2.0, prim.h + 2.0);
+                    if (needTxMap)
+                        lb = m_transform.mapRect(lb);
+                    if (clampClipBounds)
+                        lb &= clipRectF;
+                    m_outPrimLocalBounds->push_back(lb);
+                }
+            } else {
+                pushPrimitiveClipped(prim);
+            }
+        }
+
+        if (m_outStats)
+            m_outStats->glyphPrimCount += uint32_t(m_outPrimitives.size() - startPrims);
+
+        // Handle Underline / Overline / StrikeOut decorations analytically
+        const qreal runWidth = ti.width.toReal();
+        if (runWidth > 0.0 && (ti.flags & (QTextItem::Underline | QTextItem::StrikeOut | QTextItem::Overline))) {
+            const qreal lineThick = std::max(1.0, ti.fontEngine->lineThickness().toReal());
+            auto emitDeco = [&](qreal yTop) {
+                PhaseGpuPrimitive dp{};
+                dp.kind = uint32_t(PhasePrimKind::SolidRect);
+                dp.transformIndex = txSlot;
+                dp.x = float(p.x());
+                dp.y = float(yTop);
+                dp.w = float(runWidth);
+                dp.h = float(lineThick);
+                dp.c0r = cr;
+                dp.c0g = cg;
+                dp.c0b = cb;
+                dp.c0a = ca;
+                pushPrimitiveClipped(dp);
+            };
+            if (ti.flags & QTextItem::Underline)
+                emitDeco(p.y() + ti.fontEngine->underlinePosition().toReal());
+            if (ti.flags & QTextItem::StrikeOut)
+                emitDeco(p.y() - ti.fontEngine->ascent().toReal() * 0.35);
+            if (ti.flags & QTextItem::Overline)
+                emitDeco(p.y() - ti.fontEngine->ascent().toReal());
+        }
+        return;
+    }
+
+    // Color emoji / COLRv0 / CBDT fallback path via QRawFont + QPhaseVisuals
+    QRawFont rawFont;
+    QRawFontPrivate::get(rawFont)->setFontEngine(ti.fontEngine);
+    if (!rawFont.isValid())
+        return;
+
+    QList<quint32> glyphIndexes;
+    QList<QPointF> positions;
+    glyphIndexes.reserve(n);
+    positions.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        glyphIndexes.append(outGlyphs[i]);
+        positions.append(outPositions[i].toPointF());
+    }
+
+    QGlyphRun run;
+    run.setRawFont(rawFont);
+    run.setGlyphIndexes(glyphIndexes);
+    run.setPositions(positions);
+
     QPhaseVisualsPrivate vp{};
     vp.arena = &m_arena;
     vp.transformIndex = txSlot;
@@ -1181,20 +1317,19 @@ void QPhasePaintEngine::drawTextItem(const QPointF &p, const QTextItem &textItem
     QPhaseVisuals vis(&vp);
     vis.glyphRun(run, p, color);
 
-    // Handle Underline / Overline / StrikeOut decorations analytically
     const qreal runWidth = ti.width.toReal();
     if (runWidth > 0.0) {
         const qreal lineThick = std::max(1.0, rawFont.lineThickness());
-        if (ti.flags & QTextItem::Underline) {
+        if (ti.flags & QTextItem::Underline)
             vis.solidRect(QRectF(p.x(), p.y() + rawFont.underlinePosition(), runWidth, lineThick), color);
-        }
-        if (ti.flags & QTextItem::StrikeOut) {
+        if (ti.flags & QTextItem::StrikeOut)
             vis.solidRect(QRectF(p.x(), p.y() - rawFont.ascent() * 0.35, runWidth, lineThick), color);
-        }
-        if (ti.flags & QTextItem::Overline) {
+        if (ti.flags & QTextItem::Overline)
             vis.solidRect(QRectF(p.x(), p.y() - rawFont.ascent(), runWidth, lineThick), color);
-        }
     }
+
+    if (m_outStats)
+        m_outStats->glyphPrimCount += uint32_t(vp.recordedPrimitives.size());
 
     for (const PhaseGpuPrimitive &prim : vp.recordedPrimitives)
         pushPrimitiveClipped(prim);

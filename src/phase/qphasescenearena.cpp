@@ -671,25 +671,46 @@ std::unique_ptr<QPhaseSceneArena> QPhaseSceneArena::cloneForCpuCalibration()
     return snap;
 }
 
-uint32_t QPhaseSceneArena::registerOrGetGlyph(const QRawFont &rawFont, uint32_t glyphId)
+QPhaseSceneArena::PhaseFontFaceHandle QPhaseSceneArena::resolveFontFace(QFontEngine *fe)
 {
-    if (!rawFont.isValid() || !m_hbGpuDraw)
-        return 0;
-
-    QFontEngine *fe = QRawFontPrivate::get(rawFont)->fontEngine;
+    PhaseFontFaceHandle out{};
     if (!fe)
-        return 0;
-
+        return out;
     hb_face_t *hbFace = hb_qt_face_get_for_engine(fe);
     if (!hbFace)
+        return out;
+    out.hbFace = hbFace;
+
+    auto it = m_faceColorFlags.constFind(hbFace);
+    uint8_t flags = 0;
+    if (it != m_faceColorFlags.constEnd()) {
+        flags = it.value();
+    } else {
+        if (hb_ot_color_has_layers(hbFace))
+            flags |= 1u;
+        if (hb_ot_color_has_png(hbFace) || hb_ot_color_has_paint(hbFace) || hb_ot_color_has_svg(hbFace))
+            flags |= 2u;
+        m_faceColorFlags.insert(hbFace, flags);
+    }
+    out.hasColorLayers = (flags & 1u) != 0u;
+    out.hasBitmapColor = (flags & 2u) != 0u || (fe->glyphFormat == QFontEngine::Format_ARGB);
+    return out;
+}
+
+uint32_t QPhaseSceneArena::registerOrGetGlyphForFace(hb_face_t *hbFace, uint32_t glyphId)
+{
+    if (!hbFace || !m_hbGpuDraw)
         return 0;
 
     const uint64_t mapKey = (uint64_t(reinterpret_cast<uintptr_t>(hbFace)) << 16) ^ (uint64_t(glyphId) * 0x9E3779B97F4A7C15ull);
     auto found = m_glyphCurveMap.constFind(mapKey);
     if (found != m_glyphCurveMap.constEnd()) {
-        const PhaseCurveEntry &existing = m_curves[found.value()];
+        const uint32_t cachedId = found.value();
+        if (cachedId == 0u)
+            return 0u; // Cached empty/whitespace glyph (e.g. ' ') -> instant O(1) skip!
+        const PhaseCurveEntry &existing = m_curves[cachedId];
         if (existing.glyphId == glyphId)
-            return found.value();
+            return cachedId;
     }
 
     hb_font_t *unscaledFont = m_unscaledHbFonts.value(hbFace, nullptr);
@@ -706,13 +727,16 @@ uint32_t QPhaseSceneArena::registerOrGetGlyph(const QRawFont &rawFont, uint32_t 
 
     hb_glyph_extents_t ext{};
     hb_blob_t *blob = hb_gpu_draw_encode(m_hbGpuDraw, &ext);
-    if (!blob)
+    if (!blob) {
+        m_glyphCurveMap.insert(mapKey, 0u);
         return 0;
+    }
 
     unsigned int blobBytes = 0;
     const char *blobData = hb_blob_get_data(blob, &blobBytes);
     if (blobBytes == 0 || ext.width == 0 || ext.height == 0) {
         hb_gpu_draw_recycle_blob(m_hbGpuDraw, blob);
+        m_glyphCurveMap.insert(mapKey, 0u);
         return 0;
     }
 
@@ -739,6 +763,19 @@ uint32_t QPhaseSceneArena::registerOrGetGlyph(const QRawFont &rawFont, uint32_t 
     m_glyphCurveMap.insert(mapKey, curveId);
     ++m_revision;
     return curveId;
+}
+
+uint32_t QPhaseSceneArena::registerOrGetGlyph(const QRawFont &rawFont, uint32_t glyphId)
+{
+    if (!rawFont.isValid() || !m_hbGpuDraw)
+        return 0;
+
+    QFontEngine *fe = QRawFontPrivate::get(rawFont)->fontEngine;
+    if (!fe)
+        return 0;
+
+    hb_face_t *hbFace = hb_qt_face_get_for_engine(fe);
+    return registerOrGetGlyphForFace(hbFace, glyphId);
 }
 
 bool QPhaseSceneArena::tryGetColorGlyphLayers(const QRawFont &rawFont,

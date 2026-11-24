@@ -54,6 +54,16 @@ struct QPhaseWidgetImageCache {
     void clear(QPhaseSceneArena &arena);
 };
 
+// Per-paint telemetry emitted by QPhasePaintEngine so QPhaseWidgetBridge can
+// adaptively route complex or ultra-dense widgets to direct QRasterPaintEngine!
+struct QPhaseWidgetPaintStats {
+    uint32_t fallbackCount = 0;           // Cache-miss emitRasterFallback() calls this paint
+    uint64_t fallbackPixels = 0;          // Total physical pixels rasterized in fallback misses
+    uint32_t glyphPrimCount = 0;          // Total glyph primitives emitted this paint
+    bool usedUnsupportedCompMode = false; // QPainter::CompositionMode != SourceOver
+    bool usedComplexClipPath = false;     // Non-rectangular curved/polygon clip path
+};
+
 class QPhasePaintEngine final : public QPaintEngine
 {
 public:
@@ -66,7 +76,8 @@ public:
                       std::vector<uint32_t> &outTransientTransforms,
                       std::vector<uint32_t> &outTransientClips,
                       std::vector<uint32_t> &outOwnedImageSlots,
-                      std::vector<QRectF> *outPrimLocalBounds = nullptr);
+                      std::vector<QRectF> *outPrimLocalBounds = nullptr,
+                      QPhaseWidgetPaintStats *outStats = nullptr);
     ~QPhasePaintEngine() override = default;
 
     bool begin(QPaintDevice *pdev) override;
@@ -95,7 +106,7 @@ public:
 
 private:
     uint32_t ensureCurrentTransformSlot();
-    void ensureCurrentClipSlots(std::vector<uint32_t> &outClipSlots);
+    const std::vector<uint32_t> &ensureCurrentClipSlots();
     void pushPrimitiveClipped(const PhaseGpuPrimitive &prim);
     void emitRasterFallback(const QRectF &localBounds,
                             uint64_t extraHash,
@@ -114,6 +125,7 @@ private:
     std::vector<uint32_t> &m_outTransientClips;
     std::vector<uint32_t> &m_outOwnedImageSlots;
     std::vector<QRectF> *m_outPrimLocalBounds = nullptr;
+    QPhaseWidgetPaintStats *m_outStats = nullptr;
 
     QTransform m_transform;
     QPen m_pen{Qt::black};

@@ -55,6 +55,7 @@ public:
     void setRenderPolicy(std::unique_ptr<QPhaseRenderPolicy> policy);
     const char *renderPolicyName() const noexcept;
     void reportDirtyAreaRatio(float ratio) noexcept;
+    void reportFrameHints(uint32_t surfaceHints, uint32_t dirtyHints) noexcept;
     void setForcedAffinity(QPhaseRendererAffinity affinity, bool blocking = false);
 
     // Schedules a UI-Reflex VSync-deadline coalesced sync+present
